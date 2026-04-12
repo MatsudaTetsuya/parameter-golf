@@ -96,10 +96,15 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.02))
+    muon_wd = float(os.environ.get("MUON_WD", 0.085))
+    embed_wd = float(os.environ.get("EMBED_WD", 0.085))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
     # Quantization & compression.
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
+    gptq_calibration_shuffled = bool(int(os.environ.get("GPTQ_CALIBRATION_SHUFFLED", "1")))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
@@ -141,10 +146,24 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                nesterov=nesterov,
+                weight_decay=weight_decay,
+            ),
         )
 
     @torch.no_grad()
@@ -166,6 +185,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            weight_decay = group["weight_decay"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -192,6 +212,8 @@ class Muon(torch.optim.Optimizer):
 
             curr = 0
             for p in params:
+                if weight_decay > 0.0:
+                    p.data.mul_(1.0 - lr * weight_decay)
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
@@ -914,6 +936,93 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
+
+# Adapted from the readable 2026-04-05 SP8192 record: use shuffled non-overlapping
+# sequences for GPTQ calibration so Hessians are not taken only from the stream prefix.
+class CalibrationSequenceLoader:
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, seq_len: int, seed: int):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.seq_len = seq_len
+        self.rng = np.random.Generator(np.random.PCG64(seed + rank))
+        all_files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not all_files:
+            raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.files = all_files[rank::world_size]
+        if not self.files:
+            raise ValueError(
+                f"Calibration loader found no shards for rank={rank} world_size={world_size}; "
+                f"train_files={pattern}"
+            )
+        self.num_tokens = [self._read_num_tokens(file) for file in self.files]
+        self._tokens_cache: dict[str, Tensor] = {}
+        self.start_inds: list[list[int]] = [[] for _ in self.files]
+        for shard_idx in range(len(self.files)):
+            self._reset_shard(shard_idx)
+
+    def _read_num_tokens(self, file: Path) -> int:
+        header = np.fromfile(file, dtype="<i4", count=3)
+        if header.size != 3 or int(header[0]) != 20240520 or int(header[1]) != 1:
+            raise ValueError(f"Unexpected shard header for {file}")
+        return int(header[2])
+
+    def _get_tokens(self, shard_idx: int) -> Tensor:
+        key = str(self.files[shard_idx])
+        tokens = self._tokens_cache.get(key)
+        if tokens is None:
+            tokens = load_data_shard(self.files[shard_idx])
+            self._tokens_cache[key] = tokens
+        return tokens
+
+    def _reset_shard(self, shard_idx: int) -> None:
+        num_tokens = self.num_tokens[shard_idx]
+        max_phase = min(self.seq_len - 1, max(0, num_tokens - self.seq_len - 1))
+        phase = int(self.rng.integers(max_phase + 1)) if max_phase > 0 else 0
+        num_sequences = (num_tokens - 1 - phase) // self.seq_len
+        if num_sequences <= 0:
+            raise ValueError(
+                f"Shard {self.files[shard_idx]} is too short for seq_len={self.seq_len}: "
+                f"num_tokens={num_tokens}"
+            )
+        sequence_order = self.rng.permutation(num_sequences)
+        self.start_inds[shard_idx] = (phase + sequence_order * self.seq_len).tolist()
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        if seq_len != self.seq_len:
+            raise ValueError(f"Calibration loader was built for seq_len={self.seq_len}, got {seq_len}")
+        if global_tokens % (self.world_size * grad_accum_steps) != 0:
+            raise ValueError(
+                f"global_tokens={global_tokens} must be divisible by "
+                f"world_size*grad_accum_steps={self.world_size * grad_accum_steps}"
+            )
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        if local_tokens % self.seq_len != 0:
+            raise ValueError(
+                f"local_tokens={local_tokens} must be divisible by seq_len={self.seq_len}; "
+                f"got global_tokens={global_tokens}, world_size={self.world_size}, "
+                f"grad_accum_steps={grad_accum_steps}"
+            )
+        batch_size = local_tokens // self.seq_len
+        remaining = np.array([len(start_inds) for start_inds in self.start_inds], dtype=np.float64)
+        x = torch.empty((batch_size, self.seq_len), dtype=torch.int64)
+        y = torch.empty((batch_size, self.seq_len), dtype=torch.int64)
+        for batch_idx in range(batch_size):
+            total = remaining.sum()
+            if total <= 0:
+                for shard_idx in range(len(self.files)):
+                    self._reset_shard(shard_idx)
+                remaining = np.array([len(start_inds) for start_inds in self.start_inds], dtype=np.float64)
+                total = remaining.sum()
+            shard_idx = int(self.rng.choice(len(self.files), p=remaining / total))
+            start = self.start_inds[shard_idx].pop()
+            remaining[shard_idx] -= 1
+            tokens = self._get_tokens(shard_idx)
+            window = tokens[start : start + self.seq_len + 1].to(dtype=torch.int64)
+            x[batch_idx] = window[:-1]
+            y[batch_idx] = window[1:]
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -1398,11 +1507,11 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
+    # Adapted from the readable 2026-04-05 SP8192 stack:
+    # - token embedding uses AdamW with embedding-specific weight decay
+    # - untied lm_head keeps its dedicated Adam path
+    # - matrix params in transformer blocks use Muon with decoupled weight decay
+    # - vectors/scalars use AdamW
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -1419,10 +1528,11 @@ def main() -> None:
     if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
         scalar_params.append(base_model.skip_gates)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.embed_wd,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1430,13 +1540,15 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_wd,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_wd,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1466,6 +1578,10 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"weight_decay embed:{args.embed_wd} matrix:{args.muon_wd} "
+        f"scalar:{args.adam_wd} ema_decay:{args.ema_decay}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1552,6 +1668,17 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    ema_state: dict[str, Tensor] = {}
+    if args.ema_decay < 1.0:
+        ema_state = {
+            name: (
+                tensor.detach().float().clone()
+                if tensor.is_floating_point()
+                else tensor.detach().clone()
+            )
+            for name, tensor in base_model.state_dict().items()
+        }
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1630,6 +1757,14 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_state:
+            with torch.no_grad():
+                for name, tensor in base_model.state_dict().items():
+                    ema_tensor = ema_state[name]
+                    if ema_tensor.is_floating_point() and tensor.is_floating_point():
+                        ema_tensor.mul_(args.ema_decay).add_(tensor.detach().float(), alpha=1.0 - args.ema_decay)
+                    else:
+                        ema_tensor.copy_(tensor.detach())
         zero_grad_all()
 
         step += 1
@@ -1658,6 +1793,18 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
+    if ema_state:
+        log0("ema:applying averaged weights before serialization and GPTQ")
+        current_state = base_model.state_dict()
+        avg_state = {}
+        for name, tensor in current_state.items():
+            ema_tensor = ema_state[name]
+            if tensor.is_floating_point():
+                avg_state[name] = ema_tensor.to(device=tensor.device, dtype=tensor.dtype)
+            else:
+                avg_state[name] = ema_tensor.to(device=tensor.device, dtype=tensor.dtype)
+        base_model.load_state_dict(avg_state, strict=True)
+
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
@@ -1675,7 +1822,18 @@ def main() -> None:
     sd_cpu = {name: tensor.detach().cpu().contiguous() for name, tensor in base_model.state_dict().items()}
     log0("gptq:collecting calibration Hessians...")
     t_gptq = time.perf_counter()
-    calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    calib_loader: DistributedTokenLoader | CalibrationSequenceLoader
+    if args.gptq_calibration_shuffled:
+        calib_loader = CalibrationSequenceLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            args.train_seq_len,
+            seed=args.seed + 17,
+        )
+    else:
+        calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     hessians = collect_hessians(
         base_model,
         calib_loader,
@@ -1687,7 +1845,8 @@ def main() -> None:
     )
     log0(
         f"gptq:collected {len(hessians)} hessians in {time.perf_counter() - t_gptq:.1f}s "
-        f"matrix_bits:{args.matrix_bits} embed_bits:{args.embed_bits}"
+        f"matrix_bits:{args.matrix_bits} embed_bits:{args.embed_bits} "
+        f"shuffled_calibration:{int(args.gptq_calibration_shuffled)}"
     )
     quant_result, quant_meta, quant_stats = gptq_mixed_quantize(sd_cpu, hessians, args)
     quant_buf = io.BytesIO()
