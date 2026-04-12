@@ -68,6 +68,7 @@ class Hyperparameters:
     mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -617,6 +618,18 @@ class CausalSelfAttention(nn.Module):
             train_seq_len=train_seq_len,
             rope_dims=self.rope_dims,
         )
+        self.use_xsa = False
+
+    # Adapted from the readable SP8192 stack in 2026-04-05 and earlier efficient XSA implementations:
+    # remove the self-value component without materializing repeated KV heads.
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        batch_size, num_heads, seq_len, head_dim = y.shape
+        num_kv_heads = v.size(1)
+        group_size = num_heads // num_kv_heads
+        y_grouped = y.reshape(batch_size, num_kv_heads, group_size, seq_len, head_dim)
+        v_normalized = F.normalize(v, dim=-1).unsqueeze(2)
+        projection = (y_grouped * v_normalized).sum(dim=-1, keepdim=True) * v_normalized
+        return (y_grouped - projection).reshape(batch_size, num_heads, seq_len, head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -637,6 +650,8 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -716,6 +731,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        xsa_last_n: int,
         train_seq_len: int,
         rope_dims: int,
         ln_scale: bool,
@@ -759,6 +775,9 @@ class GPT(nn.Module):
             if skip_gates_enabled
             else None
         )
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -912,6 +931,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        xsa_last_n=args.xsa_last_n,
         train_seq_len=args.train_seq_len,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
@@ -980,6 +1000,8 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    xsa_layers = [i for i, block in enumerate(base_model.blocks) if block.attn.use_xsa]
+    log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
