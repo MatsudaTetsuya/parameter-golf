@@ -70,9 +70,9 @@ class Hyperparameters:
     skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
-    loop_start = int(os.environ.get("LOOP_START", 4))
+    loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
-    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.5))
+    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -775,8 +775,8 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        # Adapted from the readable SP8192 stack in 2026-04-05:
-        # loop layers 4-5 with activation delayed to mid-training.
+        # Adapted from the SP8192 recurrence path documented in the 2026-04-09 record:
+        # loop layers 3-5 to realize a 17-layer virtual stack, activated partway through training.
         self.looping_active = False
         if num_loops > 0:
             if not (0 <= loop_start <= loop_end < num_layers):
@@ -794,6 +794,7 @@ class GPT(nn.Module):
         else:
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, num_layers))
+        self.virtual_num_layers = len(self.encoder_indices) + len(self.decoder_indices)
         self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = (
@@ -1040,7 +1041,7 @@ def main() -> None:
     if args.num_loops > 0:
         log0(
             f"layer_loop:planned start:{args.loop_start} end:{args.loop_end} repeats:{args.num_loops} "
-            f"enable_at:{args.enable_looping_at:.3f} "
+            f"enable_at:{args.enable_looping_at:.3f} virtual_layers:{base_model.virtual_num_layers} "
             f"encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
         )
     log0(
