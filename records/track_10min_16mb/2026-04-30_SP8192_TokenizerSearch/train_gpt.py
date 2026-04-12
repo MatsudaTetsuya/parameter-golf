@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import lzma
 import math
 import os
 import random
@@ -16,7 +17,6 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -94,6 +94,16 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Quantization & compression.
+    compressor = os.environ.get("COMPRESSOR", "brotli")
+    gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
+    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
+    matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
+    embed_bits = int(os.environ.get("EMBED_BITS", 8))
+    matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
+    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 20.0))
+    quantized_model_path = os.environ.get("QUANTIZED_MODEL_PATH", "final_model.int6.ptz")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -291,8 +301,8 @@ def eval_val(
 # -----------------------------
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
+# Instead, we quantize the trained weights into a submission artifact and validate
+# the round-tripped model on the standard BPB evaluation.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -302,133 +312,263 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
-    ).split(",")
-    if pattern
-)
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
-INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+GPTQ_KEEP_FLOAT_MAX_NUMEL = 65_536
+GPTQ_SCALE_DTYPE = torch.float16
+_BSHF_MAGIC = b"BSHF"
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-    return t
+def _passthrough_quant_tensor(t: Tensor) -> Tensor:
+    if t.is_floating_point() and t.dtype in {torch.float32, torch.bfloat16}:
+        return t.to(dtype=torch.float16).contiguous()
+    return t.contiguous()
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
+# Adapted from the readable SP8192 GPTQ/SDClip implementation in the 2026-04-05 record:
+# collect Hessian approximations from calibration activations, quantize large matrices,
+# and leave small/control tensors in a compact passthrough format.
+def collect_hessians(
+    model: nn.Module,
+    train_loader: "DistributedTokenLoader",
+    global_tokens: int,
+    seq_len: int,
+    grad_accum_steps: int,
+    n_calibration_batches: int,
+    distributed: bool,
+) -> dict[str, Tensor]:
+    hessians: dict[str, Tensor] = {}
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
-        0,
-    )
+    def make_hook(name: str):
+        def hook_fn(_module, inputs, _output):
+            x = inputs[0].detach().float()
+            if x.ndim == 3:
+                x = x.reshape(-1, x.shape[-1])
+            if name not in hessians:
+                hessians[name] = torch.zeros(
+                    x.shape[1], x.shape[1], dtype=torch.float32, device=x.device
+                )
+            hessians[name].addmm_(x.T, x)
+
+        return hook_fn
+
+    def make_output_hook(name: str):
+        def hook_fn(_module, _inputs, output):
+            x = output.detach().float()
+            if x.ndim == 3:
+                x = x.reshape(-1, x.shape[-1])
+            if name not in hessians:
+                hessians[name] = torch.zeros(
+                    x.shape[1], x.shape[1], dtype=torch.float32, device=x.device
+                )
+            hessians[name].addmm_(x.T, x)
+
+        return hook_fn
+
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear) and module.weight.numel() > GPTQ_KEEP_FLOAT_MAX_NUMEL:
+            hooks.append(module.register_forward_hook(make_hook(name + ".weight")))
+    if getattr(model, "tie_embeddings", False):
+        hooks.append(model.final_norm.register_forward_hook(make_output_hook("tok_emb.weight")))
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for _ in range(n_calibration_batches):
+            x, _y = train_loader.next_batch(global_tokens, seq_len, grad_accum_steps)
+            model.forward_logits(x)
+    if was_training:
+        model.train()
+
+    for hook in hooks:
+        hook.remove()
+
+    normalizer = float(n_calibration_batches)
+    if distributed:
+        for hessian in hessians.values():
+            dist.all_reduce(hessian, op=dist.ReduceOp.SUM)
+        normalizer *= float(dist.get_world_size())
+    for name, hessian in hessians.items():
+        hessians[name] = (hessian / normalizer).cpu().contiguous()
+    return hessians
+
+
+def gptq_quantize_weight(
+    w: Tensor,
+    hessian: Tensor,
+    clip_sigmas: float,
+    clip_range: int,
+    block_size: int = 128,
+) -> tuple[Tensor, Tensor]:
+    w_orig = w.float().clone()
+    rows, cols = w_orig.shape
+    hessian = hessian.float().clone()
+
+    dead = torch.diag(hessian) == 0
+    hessian[dead, dead] = 1
+    damp = 0.01 * hessian.diag().mean()
+    hessian.diagonal().add_(damp)
+
+    perm = torch.argsort(hessian.diag(), descending=True)
+    invperm = torch.argsort(perm)
+    w_perm = w_orig[:, perm].clone()
+    w_perm[:, dead[perm]] = 0
+    hessian = hessian[perm][:, perm]
+
+    hessian_inv = torch.cholesky_inverse(torch.linalg.cholesky(hessian))
+    hessian_inv = torch.linalg.cholesky(hessian_inv, upper=True)
+
+    row_std = w_orig.std(dim=1)
+    scale = (clip_sigmas * row_std / clip_range).clamp_min(1e-10).to(GPTQ_SCALE_DTYPE)
+    scale_f = scale.float()
+
+    quantized = torch.zeros(rows, cols, dtype=torch.int8)
+    w_work = w_perm.clone()
+    for block_start in range(0, cols, block_size):
+        block_end = min(block_start + block_size, cols)
+        w_block = w_work[:, block_start:block_end].clone()
+        hinv_block = hessian_inv[block_start:block_end, block_start:block_end]
+        err_block = torch.zeros(rows, block_end - block_start)
+        for j in range(block_end - block_start):
+            w_col = w_block[:, j]
+            denom = hinv_block[j, j]
+            q_col = torch.clamp(torch.round(w_col / scale_f), -clip_range, clip_range)
+            quantized[:, block_start + j] = q_col.to(torch.int8)
+            err = (w_col - q_col.float() * scale_f) / denom
+            err_block[:, j] = err
+            w_block[:, j:] -= err.unsqueeze(1) * hinv_block[j, j:].unsqueeze(0)
+        if block_end < cols:
+            w_work[:, block_end:] -= err_block @ hessian_inv[block_start:block_end, block_end:]
+
+    return quantized[:, invperm].contiguous(), scale.contiguous()
+
+
+def gptq_mixed_quantize(
+    state_dict: dict[str, Tensor],
+    hessians: dict[str, Tensor],
+    args: Hyperparameters,
+) -> tuple[dict[str, Tensor], dict[str, dict[str, object]], dict[str, int]]:
+    result: dict[str, Tensor] = {}
+    meta: dict[str, dict[str, object]] = {}
+    stats = {
+        "baseline_tensor_bytes": 0,
+        "quantized_payload_bytes": 0,
+        "num_quantized_tensors": 0,
+        "num_passthrough_tensors": 0,
+    }
 
     for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
+        t = tensor.detach().cpu().contiguous()
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
 
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
+        should_quantize = (
+            t.is_floating_point()
+            and t.ndim == 2
+            and t.numel() > GPTQ_KEEP_FLOAT_MAX_NUMEL
+            and name in hessians
+        )
+        if not should_quantize:
+            kept = _passthrough_quant_tensor(t)
+            result[name] = kept
+            meta[name] = {"scheme": "passthrough"}
+            stats["quantized_payload_bytes"] += tensor_nbytes(kept)
+            stats["num_passthrough_tensors"] += 1
             continue
 
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            continue
+        is_embedding = name == "tok_emb.weight"
+        bits = args.embed_bits if is_embedding else args.matrix_bits
+        clip_sigmas = args.embed_clip_sigmas if is_embedding else args.matrix_clip_sigmas
+        q, scale = gptq_quantize_weight(
+            t,
+            hessians[name],
+            clip_sigmas=clip_sigmas,
+            clip_range=2 ** (bits - 1) - 1,
+        )
+        result[name + ".q"] = q
+        result[name + ".scale"] = scale
+        meta[name] = {"scheme": "gptq", "bits": bits}
+        stats["quantized_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(scale)
+        stats["num_quantized_tensors"] += 1
 
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+    return result, meta, stats
 
-    obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-    }
-    if qmeta:
-        obj["qmeta"] = qmeta
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
 
-def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
+def dequantize_mixed(
+    result: dict[str, Tensor],
+    meta: dict[str, dict[str, object]],
+    template_state_dict: dict[str, Tensor],
+) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
-    qmeta = obj.get("qmeta", {})
-    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
-        dtype = getattr(torch, obj["dtypes"][name])
-        s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
-            s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
-        else:
-            scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
-    for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
+    for name, orig in template_state_dict.items():
+        info = meta.get(name)
+        if info is None:
+            continue
+        if info["scheme"] == "passthrough":
+            t = result[name]
+            if t.is_floating_point():
+                out[name] = t.to(dtype=orig.dtype).contiguous()
+            else:
+                out[name] = t.contiguous()
+            continue
+        q = result[name + ".q"]
+        scale = result[name + ".scale"].float()
+        out[name] = (
+            q.float() * scale.view(q.shape[0], *([1] * (q.ndim - 1)))
+        ).to(dtype=orig.dtype).contiguous()
     return out
+
+
+def _byte_shuffle(data: bytes, stride: int = 2) -> bytes:
+    if stride <= 1 or len(data) < stride:
+        return data
+    src = np.frombuffer(data, dtype=np.uint8)
+    out = np.empty(len(src), dtype=np.uint8)
+    dest_off = 0
+    for pos in range(stride):
+        chunk = src[pos::stride]
+        out[dest_off : dest_off + len(chunk)] = chunk
+        dest_off += len(chunk)
+    return _BSHF_MAGIC + bytes([stride]) + out.tobytes()
+
+
+def _byte_unshuffle(data: bytes) -> bytes:
+    if len(data) < 5 or data[:4] != _BSHF_MAGIC:
+        return data
+    stride = data[4]
+    if stride < 2:
+        return data[5:]
+    payload = np.frombuffer(data, dtype=np.uint8, offset=5)
+    out = np.empty(len(payload), dtype=np.uint8)
+    src_off = 0
+    for pos in range(stride):
+        chunk_len = len(payload) // stride + (1 if pos < len(payload) % stride else 0)
+        out[pos::stride][:chunk_len] = payload[src_off : src_off + chunk_len]
+        src_off += chunk_len
+    return out.tobytes()
+
+
+def _compress(data: bytes, compressor: str) -> bytes:
+    data = _byte_shuffle(data)
+    if compressor == "lzma":
+        return lzma.compress(data, preset=6)
+    if compressor == "brotli":
+        import brotli
+
+        return brotli.compress(data, quality=11)
+    raise ValueError(f"Unknown compressor: {compressor!r}")
+
+
+def _decompress(data: bytes, compressor: str) -> bytes:
+    if compressor == "lzma":
+        raw = lzma.decompress(data)
+    elif compressor == "brotli":
+        import brotli
+
+        raw = brotli.decompress(data)
+    else:
+        raise ValueError(f"Unknown compressor: {compressor!r}")
+    return _byte_unshuffle(raw)
 
 
 # -----------------------------
@@ -814,7 +954,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_features(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -840,15 +980,21 @@ class GPT(nn.Module):
                     x = x + scaled_skip
             x = self.blocks[i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        return self.final_norm(x)
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        x = self.forward_features(input_ids).reshape(-1, self.tok_emb.weight.size(1))
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids)
+        targets = target_ids.reshape(-1)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1067,6 +1213,9 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    if max_wallclock_ms is not None:
+        max_wallclock_ms -= args.gptq_reserve_seconds * 1000.0
+        log0(f"gptq:reserving {args.gptq_reserve_seconds:.0f}s effective_train_budget:{max_wallclock_ms:.0f}ms")
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1240,8 +1389,8 @@ def main() -> None:
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # Save the raw state (useful for debugging/loading in PyTorch directly), then produce
+    # the compressed GPTQ artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1251,30 +1400,48 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    sd_cpu = {name: tensor.detach().cpu().contiguous() for name, tensor in base_model.state_dict().items()}
+    log0("gptq:collecting calibration Hessians...")
+    t_gptq = time.perf_counter()
+    calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    hessians = collect_hessians(
+        base_model,
+        calib_loader,
+        args.train_batch_tokens,
+        args.train_seq_len,
+        grad_accum_steps,
+        args.gptq_calibration_batches,
+        distributed,
+    )
+    log0(
+        f"gptq:collected {len(hessians)} hessians in {time.perf_counter() - t_gptq:.1f}s "
+        f"matrix_bits:{args.matrix_bits} embed_bits:{args.embed_bits}"
+    )
+    quant_result, quant_meta, quant_stats = gptq_mixed_quantize(sd_cpu, hessians, args)
     quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
+    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = _compress(quant_raw, args.compressor)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(args.quantized_model_path, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(args.quantized_model_path)
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["quantized_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model quantized+{args.compressor}: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['quantized_payload_bytes']} raw_torch:{quant_raw_bytes} "
+            f"payload_ratio:{ratio:.2f}x quantized_tensors:{quant_stats['num_quantized_tensors']})"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size quantized+{args.compressor}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(args.quantized_model_path, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk, args.compressor)), map_location="cpu")
+    base_model.load_state_dict(dequantize_mixed(quant_state["w"], quant_state["m"], sd_cpu), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1291,10 +1458,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_quantized_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_quantized_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
