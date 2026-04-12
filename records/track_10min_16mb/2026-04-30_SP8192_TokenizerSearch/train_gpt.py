@@ -30,18 +30,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
+# Default SP8192-oriented static stack:
+# - 11 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 4x MLP expansion
+# - vocab size 8192, sequence length 2048, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -55,20 +55,24 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    negative_slope = float(os.environ.get("NEGATIVE_SLOPE", 0.5))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -289,7 +293,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates",
     ).split(",")
     if pattern
 )
@@ -522,10 +526,21 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0):
+    # Adapted from the readable SP8192 stack in 2026-04-05:
+    # partial RoPE plus train-sequence-aware base scaling for longer eval contexts.
+    def __init__(self, dim: int, base: float = 10000.0, train_seq_len: int = 1024, rope_dims: int = 0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        effective_rope_dims = rope_dims if rope_dims > 0 else dim
+        if effective_rope_dims > dim:
+            raise ValueError(f"rope_dims={effective_rope_dims} exceeds head_dim={dim}")
+        if effective_rope_dims % 2 != 0:
+            raise ValueError(f"rope_dims must be even, got {effective_rope_dims}")
+        self.base = base
+        self.train_seq_len = train_seq_len
+        self.rope_dims = effective_rope_dims
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -538,15 +553,30 @@ class Rotary(nn.Module):
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
         ):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
+            if seq_len > self.train_seq_len:
+                scale = seq_len / self.train_seq_len
+                new_base = self.base * (scale ** (self.rope_dims / (self.rope_dims - 2)))
+                inv_freq = 1.0 / (
+                    new_base
+                    ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32, device=device) / self.rope_dims)
+                )
+            else:
+                inv_freq = self.inv_freq.to(device)
+            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+            freqs = torch.outer(t, inv_freq)
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
+    if 0 < rope_dims < x.size(-1):
+        x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
+        half = rope_dims // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        x_rope = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+        return torch.cat((x_rope, x_pass), dim=-1)
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
@@ -560,6 +590,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        train_seq_len: int,
+        rope_dims: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -578,7 +610,13 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
+        self.rotary = Rotary(
+            self.head_dim,
+            base=rope_base,
+            train_seq_len=train_seq_len,
+            rope_dims=self.rope_dims,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -588,8 +626,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -604,16 +642,18 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    # Adapted from the readable SP8192 stack in 2026-04-05:
+    # LeakyReLU(0.5)^2 replaces relu^2 in the static architecture.
+    def __init__(self, dim: int, mlp_mult: float, negative_slope: float):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = int(mlp_mult * dim)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.negative_slope = negative_slope
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=self.negative_slope)
         return self.proj(x.square())
 
 
@@ -623,26 +663,42 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         rope_base: float,
         qk_gain_init: float,
+        train_seq_len: int,
+        rope_dims: int,
+        negative_slope: float,
+        layer_idx: int,
+        ln_scale: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            train_seq_len,
+            rope_dims,
+        )
+        self.mlp = MLP(dim, mlp_mult, negative_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(
+            self.mlp_norm(x_out) * self.ln_scale_factor
+        )
+        return x_out
 
 
 class GPT(nn.Module):
@@ -653,12 +709,17 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         tie_embeddings: bool,
+        skip_gates_enabled: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        train_seq_len: int,
+        rope_dims: int,
+        ln_scale: bool,
+        negative_slope: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +741,11 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    train_seq_len,
+                    rope_dims,
+                    negative_slope,
+                    i,
+                    ln_scale,
                 )
                 for i in range(num_layers)
             ]
@@ -688,6 +754,11 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.skip_gates = (
+            nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
+            if skip_gates_enabled
+            else None
+        )
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -709,7 +780,12 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                scaled_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                if self.skip_gates is not None:
+                    gate = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
+                    x = torch.lerp(scaled_skip, x, gate)
+                else:
+                    x = x + scaled_skip
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -831,10 +907,15 @@ def main() -> None:
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
+        skip_gates_enabled=args.skip_gates_enabled,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        train_seq_len=args.train_seq_len,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
+        negative_slope=args.negative_slope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -861,6 +942,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
+        scalar_params.append(base_model.skip_gates)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
