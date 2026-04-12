@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import json
 import lzma
 import math
 import os
@@ -200,6 +201,18 @@ def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
 ) -> tuple[Tensor, Tensor, Tensor]:
     sp_vocab_size = int(sp.vocab_size())
+    space_piece_id = int(sp.piece_to_id("▁"))
+    if (
+        space_piece_id < 0
+        or space_piece_id == int(sp.unk_id())
+        or sp.is_control(space_piece_id)
+        or sp.is_unknown(space_piece_id)
+        or sp.is_unused(space_piece_id)
+    ):
+        raise ValueError(
+            "Tokenizer has no standalone ▁ piece. Current byte accounting rejects such tokenizers "
+            "because BPB can be mis-counted."
+        )
     table_size = max(sp_vocab_size, vocab_size)
     base_bytes_np = np.zeros((table_size,), dtype=np.int16)
     has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
@@ -235,6 +248,57 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     return tokens[: usable + 1]
 
 
+# Adapted from the manifest-based dataset/tokenizer guard in train_gpt_mlx.py:
+# val_bpb is only meaningful if the tokenizer used for byte accounting matches
+# the tokenizer that produced the dataset shards.
+def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int]:
+    dataset_dir = Path(data_path).resolve()
+    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    if len(dataset_dir.parents) < 2:
+        return dataset_dir.name, actual_train_files
+    manifest_path = dataset_dir.parents[1] / "manifest.json"
+    if not manifest_path.is_file():
+        return dataset_dir.name, actual_train_files
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir.name), None)
+    if dataset_entry is None:
+        return dataset_dir.name, actual_train_files
+
+    tokenizer_name = dataset_entry.get("tokenizer_name")
+    tokenizer_entry = (
+        next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
+        if tokenizer_name
+        else None
+    )
+    expected_name = Path((tokenizer_entry or {}).get("model_path") or (tokenizer_entry or {}).get("path") or "").name
+    if expected_name and Path(tokenizer_path).name != expected_name:
+        raise ValueError(f"{dataset_dir.name} expects tokenizer {expected_name}, got {Path(tokenizer_path).name}")
+
+    expected_train_files = (dataset_entry.get("stats") or {}).get("files_train")
+    if expected_train_files is not None and actual_train_files > int(expected_train_files):
+        raise ValueError(
+            f"{dataset_dir.name} has more train shards than expected: found {actual_train_files}, "
+            f"manifest says {int(expected_train_files)}"
+        )
+    return dataset_dir.name, actual_train_files
+
+
+def validate_batching_args(args: Hyperparameters, world_size: int, grad_accum_steps: int) -> None:
+    train_denom = world_size * grad_accum_steps * args.train_seq_len
+    if args.train_batch_tokens % train_denom != 0:
+        raise ValueError(
+            f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must be divisible by "
+            f"WORLD_SIZE*GRAD_ACCUM_STEPS*TRAIN_SEQ_LEN={train_denom}"
+        )
+    val_denom = world_size * grad_accum_steps * args.train_seq_len
+    if args.val_batch_size % val_denom != 0:
+        raise ValueError(
+            f"VAL_BATCH_SIZE={args.val_batch_size} must be divisible by "
+            f"WORLD_SIZE*GRAD_ACCUM_STEPS*TRAIN_SEQ_LEN={val_denom}"
+        )
+
+
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -250,6 +314,11 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    if args.val_batch_size % (world_size * grad_accum_steps * args.train_seq_len) != 0:
+        raise ValueError(
+            f"VAL_BATCH_SIZE={args.val_batch_size} must be divisible by "
+            "WORLD_SIZE*GRAD_ACCUM_STEPS*TRAIN_SEQ_LEN for reshaping"
+        )
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -624,8 +693,8 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
+    # Each call consumes one contiguous chunk shared across ranks, then each rank reads
+    # a locally shifted window so no rank boundary drops a target token.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -633,11 +702,21 @@ class DistributedTokenLoader:
         self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        if global_tokens % (self.world_size * grad_accum_steps) != 0:
+            raise ValueError(
+                f"global_tokens={global_tokens} must be divisible by "
+                f"world_size*grad_accum_steps={self.world_size * grad_accum_steps}"
+            )
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        if local_tokens % seq_len != 0:
+            raise ValueError(
+                f"local_tokens={local_tokens} must be divisible by seq_len={seq_len}; "
+                f"got global_tokens={global_tokens}, world_size={self.world_size}, "
+                f"grad_accum_steps={grad_accum_steps}"
+            )
+        chunk = self.stream.take(local_tokens * self.world_size + 1)
+        start = self.rank * local_tokens
+        local = chunk[start : start + local_tokens + 1].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
@@ -1022,6 +1101,7 @@ def main() -> None:
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
+    validate_batching_args(args, world_size, grad_accum_steps)
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1083,14 +1163,13 @@ def main() -> None:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
-    dataset_dir = Path(args.data_path).resolve()
-    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    dataset_name, actual_train_files = validate_dataset_tokenizer_pair(args.data_path, args.tokenizer_path)
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    log0(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
