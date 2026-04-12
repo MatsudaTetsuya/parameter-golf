@@ -69,6 +69,10 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
+    num_loops = int(os.environ.get("NUM_LOOPS", 2))
+    loop_start = int(os.environ.get("LOOP_START", 4))
+    loop_end = int(os.environ.get("LOOP_END", 5))
+    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.5))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -732,6 +736,9 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         xsa_last_n: int,
+        num_loops: int,
+        loop_start: int,
+        loop_end: int,
         train_seq_len: int,
         rope_dims: int,
         ln_scale: bool,
@@ -746,8 +753,6 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -770,6 +775,27 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # Adapted from the readable SP8192 stack in 2026-04-05:
+        # loop layers 4-5 with activation delayed to mid-training.
+        self.looping_active = False
+        if num_loops > 0:
+            if not (0 <= loop_start <= loop_end < num_layers):
+                raise ValueError(
+                    f"invalid loop range [{loop_start}, {loop_end}] for num_layers={num_layers}"
+                )
+            loop_segment = list(range(loop_start, loop_end + 1))
+            all_indices = list(range(loop_start))
+            for _ in range(num_loops + 1):
+                all_indices.extend(loop_segment)
+            all_indices.extend(range(loop_end + 1, num_layers))
+            num_encoder_layers = len(all_indices) // 2
+            self.encoder_indices = all_indices[:num_encoder_layers]
+            self.decoder_indices = all_indices[num_encoder_layers:]
+        else:
+            self.encoder_indices = list(range(self.num_encoder_layers))
+            self.decoder_indices = list(range(self.num_encoder_layers, num_layers))
+        self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = (
             nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
             if skip_gates_enabled
@@ -792,20 +818,26 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        encoder_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
+        decoder_iter = (
+            self.decoder_indices
+            if self.looping_active
+            else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
+        )
 
         # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
+        for i in encoder_iter:
             x = self.blocks[i](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                scaled_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if self.skip_gates is not None:
-                    gate = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
+        for skip_idx, i in enumerate(decoder_iter):
+            if skips and skip_idx < self.num_skip_weights:
+                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                if self.skip_gates is not None and skip_idx < self.skip_gates.size(0):
+                    gate = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                     x = torch.lerp(scaled_skip, x, gate)
                 else:
                     x = x + scaled_skip
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -932,6 +964,9 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         xsa_last_n=args.xsa_last_n,
+        num_loops=args.num_loops,
+        loop_start=args.loop_start,
+        loop_end=args.loop_end,
         train_seq_len=args.train_seq_len,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
@@ -1002,6 +1037,12 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     xsa_layers = [i for i, block in enumerate(base_model.blocks) if block.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    if args.num_loops > 0:
+        log0(
+            f"layer_loop:planned start:{args.loop_start} end:{args.loop_end} repeats:{args.num_loops} "
+            f"enable_at:{args.enable_looping_at:.3f} "
+            f"encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
+        )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1057,6 +1098,26 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        if args.num_loops > 0:
+            base_model.looping_active = True
+            log0(
+                f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
+            )
+            for warmup_step in range(args.warmup_steps):
+                zero_grad_all()
+                for micro_step in range(grad_accum_steps):
+                    if distributed:
+                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        warmup_loss = model(x, y)
+                    (warmup_loss * grad_scale).backward()
+                for opt in optimizers:
+                    opt.step()
+                zero_grad_all()
+                if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                    log0(f"loop_warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            base_model.looping_active = False
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1110,6 +1171,17 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        train_frac = (
+            step / max(args.iterations, 1)
+            if max_wallclock_ms is None
+            else elapsed_ms / max(max_wallclock_ms, 1e-9)
+        )
+        if args.num_loops > 0 and not base_model.looping_active and train_frac >= args.enable_looping_at:
+            base_model.looping_active = True
+            log0(
+                f"layer_loop:enabled step:{step} frac:{train_frac:.3f} "
+                f"encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
+            )
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
