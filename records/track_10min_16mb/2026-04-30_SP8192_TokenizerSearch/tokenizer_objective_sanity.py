@@ -71,6 +71,7 @@ def evaluate_candidate_specs(
     *,
     split_dir: str | Path | None = None,
     split_manifest_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
     alpha: float = 0.0,
     ngram_order: int = 3,
     add_k: float = 0.1,
@@ -85,6 +86,7 @@ def evaluate_candidate_specs(
             split_manifest_path=split_manifest_path,
             tokenizer_vocab_path=spec.tokenizer_vocab_path,
             tokenizer_asset_paths=spec.tokenizer_asset_paths,
+            cache_dir=cache_dir,
             alpha=alpha,
             ngram_order=ngram_order,
             add_k=add_k,
@@ -126,6 +128,7 @@ def run_objective_sanity_check(
     candidates_path: str | Path,
     split_dir: str | Path | None = None,
     split_manifest_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
     alpha: float = 0.0,
     ngram_order: int = 3,
     add_k: float = 0.1,
@@ -134,6 +137,7 @@ def run_objective_sanity_check(
         load_candidate_specs(candidates_path),
         split_dir=split_dir,
         split_manifest_path=split_manifest_path,
+        cache_dir=cache_dir,
         alpha=alpha,
         ngram_order=ngram_order,
         add_k=add_k,
@@ -145,6 +149,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidates", required=True, help="Path to candidate JSON config")
     parser.add_argument("--split-dir", default=None, help="Directory containing search_split.manifest.json")
     parser.add_argument("--split-manifest", default=None, help="Path to search_split.manifest.json")
+    parser.add_argument("--cache-dir", default=None, help="Optional directory for persistent evaluation cache")
     parser.add_argument("--ngram-order", type=int, default=3, help="Backoff n-gram order")
     parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
@@ -157,6 +162,7 @@ def main() -> None:
         candidates_path=args.candidates,
         split_dir=args.split_dir,
         split_manifest_path=args.split_manifest,
+        cache_dir=args.cache_dir,
         alpha=args.alpha,
         ngram_order=args.ngram_order,
         add_k=args.add_k,

@@ -289,6 +289,7 @@ def run_fixed_vocab_local_search(
     split_manifest_path: str | Path | None = None,
     output_dir: str | Path,
     base_tokenizer_vocab_path: str | Path | None = None,
+    cache_dir: str | Path | None = None,
     config: FixedVocabLocalSearchConfig | None = None,
 ) -> FixedVocabLocalSearchReport:
     search_config = FixedVocabLocalSearchConfig() if config is None else config
@@ -309,6 +310,7 @@ def run_fixed_vocab_local_search(
         tokenizer_model_path=base_model_path,
         split_manifest_path=manifest_path,
         tokenizer_vocab_path=base_vocab_path,
+        cache_dir=cache_dir,
         alpha=search_config.alpha,
         ngram_order=search_config.ngram_order,
         add_k=search_config.add_k,
@@ -377,6 +379,7 @@ def run_fixed_vocab_local_search(
                         tokenizer_model_path=model_path,
                         split_manifest_path=manifest_path,
                         tokenizer_vocab_path=vocab_path,
+                        cache_dir=cache_dir,
                         alpha=search_config.alpha,
                         ngram_order=search_config.ngram_order,
                         add_k=search_config.add_k,
@@ -439,6 +442,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-dir", default=None, help="Directory containing search_split.manifest.json")
     parser.add_argument("--split-manifest", default=None, help="Path to search_split.manifest.json")
     parser.add_argument("--output-dir", required=True, help="Directory for generated candidate models and search reports")
+    parser.add_argument("--cache-dir", default=None, help="Optional directory for persistent evaluation cache")
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
     parser.add_argument("--ngram-order", type=int, default=3, help="Backoff n-gram order")
     parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
@@ -460,6 +464,7 @@ def main() -> None:
         split_dir=args.split_dir,
         split_manifest_path=args.split_manifest,
         output_dir=args.output_dir,
+        cache_dir=args.cache_dir,
         config=FixedVocabLocalSearchConfig(
             alpha=args.alpha,
             ngram_order=args.ngram_order,

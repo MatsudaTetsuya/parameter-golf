@@ -8,6 +8,7 @@ from pathlib import Path
 import sentencepiece as spm
 
 from tokenizer_candidate_eval import evaluate_tokenizer_candidate
+from tokenizer_eval_cache import TOKENIZER_EVAL_CACHE_SUBDIR
 from tokenizer_scorer import NgramProxyConfig, TokenizerScorerConfig, score_tokenizer_paths
 from tokenizer_search_split import SEARCH_SPLIT_MANIFEST_FILENAME, SearchSplitConfig, write_search_split
 
@@ -95,6 +96,55 @@ class TokenizerCandidateEvalTest(unittest.TestCase):
         self.assertAlmostEqual(evaluation.result.score, direct.score)
         self.assertAlmostEqual(evaluation.result.proxy_bpb_holdout, direct.proxy_bpb_holdout)
         self.assertEqual(evaluation.result.holdout_token_count, direct.holdout_token_count)
+
+    def test_evaluate_tokenizer_candidate_reuses_persistent_cache(self) -> None:
+        docs_path = self._write_docs_jsonl(
+            [
+                "challenge val zero",
+                "challenge val one",
+                "hello world",
+                "hello tokenizer",
+                "small tokenizer world",
+                "world hello again",
+                "tokenizer search objective",
+            ],
+            docs_val=2,
+        )
+        split_dir = docs_path.parent / "search_split_cache"
+        write_search_split(
+            docs_path,
+            output_dir=split_dir,
+            config=SearchSplitConfig(
+                search_train_docs=3,
+                search_holdout_docs=2,
+            ),
+        )
+        model_path = self._train_bpe_model(
+            "hello world\nhello tokenizer\nsmall tokenizer world\nworld hello again\ntokenizer search objective\n",
+        )
+        cache_dir = docs_path.parent / "eval_cache"
+        first = evaluate_tokenizer_candidate(
+            tokenizer_model_path=model_path,
+            split_dir=split_dir,
+            alpha=1e-6,
+            ngram_order=3,
+            add_k=0.1,
+            cache_dir=cache_dir,
+        )
+        cache_files = list((cache_dir / TOKENIZER_EVAL_CACHE_SUBDIR).glob("*.json"))
+        self.assertEqual(len(cache_files), 1)
+        (split_dir / "search_train.jsonl").unlink()
+        (split_dir / "search_holdout.jsonl").unlink()
+        second = evaluate_tokenizer_candidate(
+            tokenizer_model_path=model_path,
+            split_dir=split_dir,
+            alpha=1e-6,
+            ngram_order=3,
+            add_k=0.1,
+            cache_dir=cache_dir,
+        )
+        self.assertAlmostEqual(first.result.score, second.result.score)
+        self.assertAlmostEqual(first.result.proxy_bpb_holdout, second.result.proxy_bpb_holdout)
 
 
 if __name__ == "__main__":
