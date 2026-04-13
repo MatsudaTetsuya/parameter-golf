@@ -14,6 +14,7 @@ import lzma
 import math
 import os
 import random
+import struct
 import subprocess
 import sys
 import time
@@ -105,6 +106,12 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     gptq_calibration_shuffled = bool(int(os.environ.get("GPTQ_CALIBRATION_SHUFFLED", "1")))
+    quant_packed_byte_shuffle_strides = tuple(
+        int(x) for x in os.environ.get("QUANT_PACKED_BYTE_SHUFFLE_STRIDES", "1,3").split(",") if x.strip()
+    )
+    quant_aux_byte_shuffle_strides = tuple(
+        int(x) for x in os.environ.get("QUANT_AUX_BYTE_SHUFFLE_STRIDES", "1,2").split(",") if x.strip()
+    )
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
@@ -451,6 +458,7 @@ def eval_val_sliding_ttt(
         f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
         f"freeze_blocks={args.ttt_freeze_blocks}"
     )
+    reset_rotary_caches(base_model)
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -599,6 +607,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 GPTQ_KEEP_FLOAT_MAX_NUMEL = 65_536
 GPTQ_SCALE_DTYPE = torch.float16
 _BSHF_MAGIC = b"BSHF"
+_SPLIT_ARTIFACT_MAGIC = b"QART1"
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -607,6 +616,64 @@ def _passthrough_quant_tensor(t: Tensor) -> Tensor:
     if t.is_floating_point() and t.dtype in {torch.float32, torch.bfloat16}:
         return t.to(dtype=torch.float16).contiguous()
     return t.contiguous()
+
+
+def pack_int6_signed(q: Tensor) -> Tensor:
+    q_cpu = q.detach().cpu().contiguous()
+    if q_cpu.dtype != torch.int8:
+        raise TypeError(f"pack_int6_signed expects int8 input, got {q_cpu.dtype}")
+    if q_cpu.numel() == 0:
+        return torch.empty((0,), dtype=torch.uint8)
+    q_i16 = q_cpu.to(torch.int16)
+    q_min = int(q_i16.min().item())
+    q_max = int(q_i16.max().item())
+    if q_min < -31 or q_max > 31:
+        raise ValueError(f"int6 pack range violation: min={q_min} max={q_max}")
+    flat = (q_i16.reshape(-1) + 32).to(torch.int32)
+    pad = (-flat.numel()) % 4
+    if pad:
+        flat = torch.cat(
+            [flat, torch.full((pad,), 32, dtype=torch.int32)],
+            dim=0,
+        )
+    flat = flat.view(-1, 4)
+    packed_words = (
+        flat[:, 0]
+        | (flat[:, 1] << 6)
+        | (flat[:, 2] << 12)
+        | (flat[:, 3] << 18)
+    )
+    packed = torch.empty((flat.shape[0], 3), dtype=torch.uint8)
+    packed[:, 0] = (packed_words & 0xFF).to(torch.uint8)
+    packed[:, 1] = ((packed_words >> 8) & 0xFF).to(torch.uint8)
+    packed[:, 2] = ((packed_words >> 16) & 0xFF).to(torch.uint8)
+    return packed.reshape(-1).contiguous()
+
+
+def unpack_int6_signed(packed: Tensor, shape: torch.Size | tuple[int, ...]) -> Tensor:
+    packed_cpu = packed.detach().cpu().contiguous()
+    if packed_cpu.dtype != torch.uint8:
+        raise TypeError(f"unpack_int6_signed expects uint8 input, got {packed_cpu.dtype}")
+    numel = math.prod(shape)
+    if numel == 0:
+        return torch.empty(shape, dtype=torch.int8)
+    expected_bytes = ((numel + 3) // 4) * 3
+    if packed_cpu.numel() != expected_bytes:
+        raise ValueError(
+            f"Packed int6 byte size mismatch: expected {expected_bytes}, got {packed_cpu.numel()}"
+        )
+    packed_words = packed_cpu.view(-1, 3).to(torch.int32)
+    packed_words = (
+        packed_words[:, 0]
+        | (packed_words[:, 1] << 8)
+        | (packed_words[:, 2] << 16)
+    )
+    unpacked = torch.empty((packed_words.shape[0], 4), dtype=torch.int16)
+    unpacked[:, 0] = (packed_words & 0x3F).to(torch.int16) - 32
+    unpacked[:, 1] = ((packed_words >> 6) & 0x3F).to(torch.int16) - 32
+    unpacked[:, 2] = ((packed_words >> 12) & 0x3F).to(torch.int16) - 32
+    unpacked[:, 3] = ((packed_words >> 18) & 0x3F).to(torch.int16) - 32
+    return unpacked.reshape(-1)[:numel].to(torch.int8).view(shape).contiguous()
 
 
 # Adapted from the readable SP8192 GPTQ/SDClip implementation in the 2026-04-05 record:
@@ -769,10 +836,13 @@ def gptq_mixed_quantize(
             clip_sigmas=clip_sigmas,
             clip_range=2 ** (bits - 1) - 1,
         )
-        result[name + ".q"] = q
+        packed = bits == 6
+        q_storage = pack_int6_signed(q) if packed else q
+        result[name + ".q"] = q_storage
         result[name + ".scale"] = scale
-        meta[name] = {"scheme": "gptq", "bits": bits}
-        stats["quantized_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(scale)
+        scheme = "gptq_int6_packed" if packed else "gptq"
+        meta[name] = {"scheme": scheme, "bits": bits}
+        stats["quantized_payload_bytes"] += tensor_nbytes(q_storage) + tensor_nbytes(scale)
         stats["num_quantized_tensors"] += 1
 
     return result, meta, stats
@@ -796,6 +866,8 @@ def dequantize_mixed(
                 out[name] = t.contiguous()
             continue
         q = result[name + ".q"]
+        if info["scheme"] == "gptq_int6_packed":
+            q = unpack_int6_signed(q, orig.shape)
         scale = result[name + ".scale"].float()
         out[name] = (
             q.float() * scale.view(q.shape[0], *([1] * (q.ndim - 1)))
@@ -832,8 +904,9 @@ def _byte_unshuffle(data: bytes) -> bytes:
     return out.tobytes()
 
 
-def _compress(data: bytes, compressor: str) -> bytes:
-    data = _byte_shuffle(data)
+def _compress(data: bytes, compressor: str, byte_shuffle_stride: int = 2) -> bytes:
+    if byte_shuffle_stride > 1:
+        data = _byte_shuffle(data, stride=byte_shuffle_stride)
     if compressor == "lzma":
         return lzma.compress(data, preset=6)
     if compressor == "brotli":
@@ -853,6 +926,192 @@ def _decompress(data: bytes, compressor: str) -> bytes:
     else:
         raise ValueError(f"Unknown compressor: {compressor!r}")
     return _byte_unshuffle(raw)
+
+
+def _compress_best(
+    data: bytes,
+    compressor: str,
+    candidate_strides: tuple[int, ...],
+) -> tuple[bytes, int, dict[int, int]]:
+    if not candidate_strides:
+        raise ValueError("candidate_strides must be non-empty")
+    sizes: dict[int, int] = {}
+    best_blob: bytes | None = None
+    best_stride: int | None = None
+    for stride in candidate_strides:
+        if stride < 1:
+            raise ValueError(f"byte shuffle stride must be >= 1, got {stride}")
+        blob = _compress(data, compressor, byte_shuffle_stride=stride)
+        sizes[stride] = len(blob)
+        if best_blob is None or len(blob) < len(best_blob):
+            best_blob = blob
+            best_stride = stride
+    assert best_blob is not None and best_stride is not None
+    return best_blob, best_stride, sizes
+
+
+def _split_quantized_tensors(
+    result: dict[str, Tensor],
+    meta: dict[str, dict[str, object]],
+) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+    packed_result: dict[str, Tensor] = {}
+    aux_result: dict[str, Tensor] = {}
+    for name, info in meta.items():
+        if info["scheme"] == "passthrough":
+            aux_result[name] = result[name]
+            continue
+        q_name = name + ".q"
+        scale_name = name + ".scale"
+        if info["scheme"] == "gptq_int6_packed":
+            packed_result[q_name] = result[q_name]
+            aux_result[scale_name] = result[scale_name]
+            continue
+        aux_result[q_name] = result[q_name]
+        aux_result[scale_name] = result[scale_name]
+    return packed_result, aux_result
+
+
+def _pack_split_artifact(packed_blob: bytes, aux_blob: bytes, compressor: str) -> bytes:
+    header = json.dumps(
+        {
+            "format": "split_quantized_artifact_v1",
+            "compressor": compressor,
+            "packed_len": len(packed_blob),
+            "aux_len": len(aux_blob),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return (
+        _SPLIT_ARTIFACT_MAGIC
+        + struct.pack("<I", len(header))
+        + header
+        + packed_blob
+        + aux_blob
+    )
+
+
+def _unpack_split_artifact(data: bytes) -> tuple[dict[str, object], bytes, bytes] | None:
+    if len(data) < len(_SPLIT_ARTIFACT_MAGIC) + 4 or not data.startswith(_SPLIT_ARTIFACT_MAGIC):
+        return None
+    cursor = len(_SPLIT_ARTIFACT_MAGIC)
+    (header_len,) = struct.unpack("<I", data[cursor : cursor + 4])
+    cursor += 4
+    header_end = cursor + header_len
+    if header_end > len(data):
+        raise ValueError("Split artifact header overruns payload")
+    header = json.loads(data[cursor:header_end].decode("utf-8"))
+    cursor = header_end
+    packed_len = int(header["packed_len"])
+    aux_len = int(header["aux_len"])
+    packed_end = cursor + packed_len
+    aux_end = packed_end + aux_len
+    if aux_end != len(data):
+        raise ValueError(
+            f"Split artifact length mismatch: expected {aux_end} bytes from header, got {len(data)}"
+        )
+    return header, data[cursor:packed_end], data[packed_end:aux_end]
+
+
+def get_runtime_meta(model: nn.Module) -> dict[str, object]:
+    return {
+        "looping_active": bool(getattr(model, "looping_active", False)),
+    }
+
+
+def apply_runtime_meta(model: nn.Module, runtime_meta: dict[str, object] | None) -> None:
+    if not runtime_meta:
+        return
+    if hasattr(model, "looping_active") and "looping_active" in runtime_meta:
+        model.looping_active = bool(runtime_meta["looping_active"])
+
+
+def save_runtime_checkpoint(path: str, model: nn.Module) -> None:
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "runtime_meta": get_runtime_meta(model),
+        },
+        path,
+    )
+
+
+def load_runtime_checkpoint(path: str) -> tuple[dict[str, Tensor], dict[str, object]]:
+    checkpoint = torch.load(path, map_location="cpu")
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        return checkpoint["state_dict"], dict(checkpoint.get("runtime_meta") or {})
+    if isinstance(checkpoint, dict):
+        return checkpoint, {}
+    raise TypeError(f"Unexpected checkpoint type: {type(checkpoint)!r}")
+
+
+def serialize_quantized_artifact(
+    result: dict[str, Tensor],
+    meta: dict[str, dict[str, object]],
+    runtime_meta: dict[str, object],
+    compressor: str,
+    packed_candidate_strides: tuple[int, ...],
+    aux_candidate_strides: tuple[int, ...],
+) -> tuple[bytes, dict[str, object]]:
+    packed_result, aux_result = _split_quantized_tensors(result, meta)
+
+    packed_raw = b""
+    packed_blob = b""
+    packed_stride = 1
+    packed_sizes: dict[int, int] = {}
+    if packed_result:
+        packed_buf = io.BytesIO()
+        torch.save({"w": packed_result}, packed_buf)
+        packed_raw = packed_buf.getvalue()
+        packed_blob, packed_stride, packed_sizes = _compress_best(
+            packed_raw,
+            compressor,
+            packed_candidate_strides,
+        )
+
+    aux_buf = io.BytesIO()
+    torch.save({"w": aux_result, "m": meta, "r": runtime_meta}, aux_buf)
+    aux_raw = aux_buf.getvalue()
+    aux_blob, aux_stride, aux_sizes = _compress_best(
+        aux_raw,
+        compressor,
+        aux_candidate_strides,
+    )
+    artifact_bytes = _pack_split_artifact(packed_blob, aux_blob, compressor)
+    return artifact_bytes, {
+        "packed_raw_bytes": len(packed_raw),
+        "aux_raw_bytes": len(aux_raw),
+        "packed_stride": packed_stride,
+        "aux_stride": aux_stride,
+        "packed_candidate_sizes": packed_sizes,
+        "aux_candidate_sizes": aux_sizes,
+        "has_packed_blob": bool(packed_result),
+    }
+
+
+def load_quantized_artifact(
+    data: bytes,
+    compressor: str,
+) -> tuple[dict[str, Tensor], dict[str, dict[str, object]], dict[str, object]]:
+    unpacked = _unpack_split_artifact(data)
+    if unpacked is not None:
+        header, packed_blob, aux_blob = unpacked
+        result: dict[str, Tensor] = {}
+        compressor_name = str(header["compressor"])
+        if packed_blob:
+            packed_state = torch.load(
+                io.BytesIO(_decompress(packed_blob, compressor_name)),
+                map_location="cpu",
+            )
+            result.update(packed_state["w"])
+        aux_state = torch.load(
+            io.BytesIO(_decompress(aux_blob, compressor_name)),
+            map_location="cpu",
+        )
+        result.update(aux_state["w"])
+        return result, aux_state["m"], dict(aux_state.get("r") or {})
+
+    legacy_state = torch.load(io.BytesIO(_decompress(data, compressor)), map_location="cpu")
+    return legacy_state["w"], legacy_state["m"], {}
 
 
 # -----------------------------
@@ -1094,6 +1353,14 @@ class Rotary(nn.Module):
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+
+
+def reset_rotary_caches(module: nn.Module) -> None:
+    for child in module.modules():
+        if isinstance(child, Rotary):
+            child._seq_len_cached = 0
+            child._cos_cached = None
+            child._sin_cached = None
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
@@ -1694,7 +1961,7 @@ def main() -> None:
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
                 args,
-                model,
+                base_model,
                 rank,
                 world_size,
                 device,
@@ -1805,6 +2072,27 @@ def main() -> None:
                 avg_state[name] = ema_tensor.to(device=tensor.device, dtype=tensor.dtype)
         base_model.load_state_dict(avg_state, strict=True)
 
+    torch.cuda.synchronize()
+    t_raw_eval = time.perf_counter()
+    raw_val_loss, raw_val_bpb = eval_val(
+        args,
+        base_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_raw_checkpoint val_loss:{raw_val_loss:.4f} val_bpb:{raw_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_raw_eval):.0f}ms"
+    )
+    log0(f"final_raw_checkpoint_exact val_loss:{raw_val_loss:.8f} val_bpb:{raw_val_bpb:.8f}")
+
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
@@ -1812,7 +2100,7 @@ def main() -> None:
     # the compressed GPTQ artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        save_runtime_checkpoint("final_model.pt", base_model)
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
@@ -1848,36 +2136,51 @@ def main() -> None:
         f"matrix_bits:{args.matrix_bits} embed_bits:{args.embed_bits} "
         f"shuffled_calibration:{int(args.gptq_calibration_shuffled)}"
     )
+    runtime_meta = get_runtime_meta(base_model)
     quant_result, quant_meta, quant_stats = gptq_mixed_quantize(sd_cpu, hessians, args)
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = _compress(quant_raw, args.compressor)
-    quant_raw_bytes = len(quant_raw)
+    quant_blob, artifact_stats = serialize_quantized_artifact(
+        quant_result,
+        quant_meta,
+        runtime_meta,
+        args.compressor,
+        args.quant_packed_byte_shuffle_strides,
+        args.quant_aux_byte_shuffle_strides,
+    )
+    quant_raw_bytes = int(artifact_stats["packed_raw_bytes"]) + int(artifact_stats["aux_raw_bytes"])
     if master_process:
         with open(args.quantized_model_path, "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize(args.quantized_model_path)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["quantized_payload_bytes"], 1)
+        packed_stride = int(artifact_stats["packed_stride"])
+        aux_stride = int(artifact_stats["aux_stride"])
         log0(
             f"Serialized model quantized+{args.compressor}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['quantized_payload_bytes']} raw_torch:{quant_raw_bytes} "
-            f"payload_ratio:{ratio:.2f}x quantized_tensors:{quant_stats['num_quantized_tensors']})"
+            f"payload_ratio:{ratio:.2f}x quantized_tensors:{quant_stats['num_quantized_tensors']} "
+            f"packed_stride:{packed_stride} aux_stride:{aux_stride} "
+            f"split_blobs:{int(bool(artifact_stats['has_packed_blob']))})"
         )
+        log0(f"quantized+{args.compressor} packed_candidate_sizes:{artifact_stats['packed_candidate_sizes']}")
+        log0(f"quantized+{args.compressor} aux_candidate_sizes:{artifact_stats['aux_candidate_sizes']}")
         log0(f"Total submission size quantized+{args.compressor}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open(args.quantized_model_path, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(_decompress(quant_blob_disk, args.compressor)), map_location="cpu")
-    base_model.load_state_dict(dequantize_mixed(quant_state["w"], quant_state["m"], sd_cpu), strict=True)
+    quant_result_disk, quant_meta_disk, quant_runtime_meta = load_quantized_artifact(
+        quant_blob_disk,
+        args.compressor,
+    )
+    base_model.load_state_dict(dequantize_mixed(quant_result_disk, quant_meta_disk, sd_cpu), strict=True)
+    apply_runtime_meta(base_model, quant_runtime_meta)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        model,
+        base_model,
         rank,
         world_size,
         device,
