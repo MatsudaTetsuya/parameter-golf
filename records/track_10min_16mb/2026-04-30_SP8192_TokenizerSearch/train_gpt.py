@@ -1346,8 +1346,10 @@ class Rotary(nn.Module):
                     ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32, device=device) / self.rope_dims)
                 )
             else:
-                inv_freq = self.inv_freq.to(device)
-            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+                inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
+            # Build and keep rotary tables in fp32 so eager and compiled paths reuse
+            # the same numerically stable cache values. Cast only on return.
+            t = torch.arange(seq_len, device=device, dtype=torch.float32)
             freqs = torch.outer(t, inv_freq)
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
