@@ -60,6 +60,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    train_shuffled = bool(int(os.environ.get("TRAIN_SHUFFLED", "1")))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
 
@@ -797,7 +798,7 @@ def unpack_int6_signed(packed: Tensor, shape: torch.Size | tuple[int, ...]) -> T
 # and leave small/control tensors in a compact passthrough format.
 def collect_hessians(
     model: nn.Module,
-    train_loader: "DistributedTokenLoader",
+    train_loader: "DistributedTokenLoader | ShuffledSequenceLoader",
     global_tokens: int,
     seq_len: int,
     grad_accum_steps: int,
@@ -1313,8 +1314,8 @@ class DistributedTokenLoader:
 
 
 # Adapted from the readable 2026-04-05 SP8192 record: use shuffled non-overlapping
-# sequences for GPTQ calibration so Hessians are not taken only from the stream prefix.
-class CalibrationSequenceLoader:
+# sequences so both training and GPTQ calibration avoid only seeing the stream prefix.
+class ShuffledSequenceLoader:
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, seq_len: int, seed: int):
         self.rank = rank
         self.world_size = world_size
@@ -1365,7 +1366,7 @@ class CalibrationSequenceLoader:
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         if seq_len != self.seq_len:
-            raise ValueError(f"Calibration loader was built for seq_len={self.seq_len}, got {seq_len}")
+            raise ValueError(f"Shuffled loader was built for seq_len={self.seq_len}, got {seq_len}")
         if global_tokens % (self.world_size * grad_accum_steps) != 0:
             raise ValueError(
                 f"global_tokens={global_tokens} must be divisible by "
@@ -1397,6 +1398,24 @@ class CalibrationSequenceLoader:
             x[batch_idx] = window[:-1]
             y[batch_idx] = window[1:]
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+def make_train_loader(
+    args: Hyperparameters,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> DistributedTokenLoader | ShuffledSequenceLoader:
+    if args.train_shuffled:
+        return ShuffledSequenceLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            args.train_seq_len,
+            seed=args.seed,
+        )
+    return DistributedTokenLoader(args.train_files, rank, world_size, device)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1973,6 +1992,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"train_loader_mode:{'shuffled' if args.train_shuffled else 'sequential'}")
     log0(f"warmdown_frac:{args.warmdown_frac:.3f} warmdown_iters:{args.warmdown_iters}")
     log0(f"seed:{args.seed}")
 
@@ -1980,7 +2000,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = make_train_loader(args, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -2059,7 +2079,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = make_train_loader(args, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -2240,9 +2260,9 @@ def main() -> None:
     sd_cpu = {name: tensor.detach().cpu().contiguous() for name, tensor in base_model.state_dict().items()}
     log0("gptq:collecting calibration Hessians...")
     t_gptq = time.perf_counter()
-    calib_loader: DistributedTokenLoader | CalibrationSequenceLoader
+    calib_loader: DistributedTokenLoader | ShuffledSequenceLoader
     if args.gptq_calibration_shuffled:
-        calib_loader = CalibrationSequenceLoader(
+        calib_loader = ShuffledSequenceLoader(
             args.train_files,
             rank,
             world_size,
