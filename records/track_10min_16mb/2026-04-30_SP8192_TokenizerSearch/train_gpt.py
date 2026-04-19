@@ -95,6 +95,7 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -166,6 +167,7 @@ class Muon(torch.optim.Optimizer):
         backend_steps: int,
         nesterov: bool = True,
         weight_decay: float = 0.0,
+        row_normalize: bool = False,
     ):
         super().__init__(
             params,
@@ -175,6 +177,7 @@ class Muon(torch.optim.Optimizer):
                 backend_steps=backend_steps,
                 nesterov=nesterov,
                 weight_decay=weight_decay,
+                row_normalize=row_normalize,
             ),
         )
 
@@ -213,6 +216,9 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    if group.get("row_normalize", False):
+                        row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
+                        g = g / row_norms.to(g.dtype)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
@@ -1945,6 +1951,7 @@ def main() -> None:
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
         weight_decay=args.muon_wd,
+        row_normalize=args.muon_row_normalize,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1987,6 +1994,7 @@ def main() -> None:
         f"weight_decay embed:{args.embed_wd} matrix:{args.muon_wd} "
         f"scalar:{args.adam_wd} ema_decay:{args.ema_decay}"
     )
+    log0(f"muon_row_normalize:{args.muon_row_normalize}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
