@@ -121,6 +121,9 @@ class Hyperparameters:
 
     # Eval-time adaptation.
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    sliding_eval_enabled = bool(int(os.environ.get("SLIDING_EVAL_ENABLED", "1" if ttt_enabled else "0")))
+    sliding_chunk_tokens = int(os.environ.get("SLIDING_CHUNK_TOKENS", "32768"))
+    sliding_batch_seqs = int(os.environ.get("SLIDING_BATCH_SEQS", "32"))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32_768))
@@ -586,6 +589,118 @@ def eval_val_sliding_ttt(
         param.requires_grad_(True)
     base_model.eval()
     log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s")
+    return val_loss, val_bpb
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    base_model: GPT,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    log0=print,
+) -> tuple[float, float]:
+    seq_len = args.train_seq_len
+    if stride <= 0 or stride > seq_len:
+        raise ValueError(f"EVAL_STRIDE must be in [1, {seq_len}], got {stride}")
+    total_tokens = val_tokens.numel() - 1
+    if total_tokens <= 0:
+        raise ValueError("Validation tokens must contain at least one prediction target")
+    if args.sliding_chunk_tokens <= 0:
+        raise ValueError(f"SLIDING_CHUNK_TOKENS must be positive, got {args.sliding_chunk_tokens}")
+    if args.sliding_batch_seqs <= 0:
+        raise ValueError(f"SLIDING_BATCH_SEQS must be positive, got {args.sliding_batch_seqs}")
+
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0
+    ]
+    num_chunks = (total_tokens + args.sliding_chunk_tokens - 1) // args.sliding_chunk_tokens
+    chunk_windows: list[list[tuple[int, int, int]]] = [[] for _ in range(num_chunks)]
+    for ws in window_starts:
+        end = min(ws + seq_len, total_tokens)
+        scored_start = 0 if ws == 0 else min(ws + seq_len - stride, total_tokens)
+        if scored_start >= end:
+            continue
+        local_start = scored_start - ws
+        local_end = end - ws
+        chunk_idx = min(scored_start // args.sliding_chunk_tokens, num_chunks - 1)
+        chunk_windows[chunk_idx].append((ws, local_start, local_end))
+
+    log0(
+        f"sliding_eval:start chunks={num_chunks} chunk_tokens={args.sliding_chunk_tokens} "
+        f"total_windows={len(window_starts)} stride={stride} batch_seqs={args.sliding_batch_seqs}"
+    )
+    reset_rotary_caches(base_model)
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    t0 = time.perf_counter()
+
+    base_model.eval()
+    with torch.no_grad():
+        for chunk_idx, windows in enumerate(chunk_windows):
+            if not windows:
+                continue
+            my_window_start = (len(windows) * rank) // world_size
+            my_window_end = (len(windows) * (rank + 1)) // world_size
+            my_windows = windows[my_window_start:my_window_end]
+            for batch_start in range(0, len(my_windows), args.sliding_batch_seqs):
+                batch_windows = my_windows[batch_start : batch_start + args.sliding_batch_seqs]
+                batch_size = len(batch_windows)
+                x_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
+                for i, (ws, local_start, local_end) in enumerate(batch_windows):
+                    end = min(ws + seq_len, total_tokens)
+                    window_len = end - ws
+                    chunk_tokens = val_tokens[ws : end + 1].to(dtype=torch.int64, device=device)
+                    x_batch[i, :window_len] = chunk_tokens[:-1]
+                    y_batch[i, :window_len] = chunk_tokens[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = base_model.forward_logits(x_batch).reshape(batch_size, seq_len, -1)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(batch_size, seq_len)
+                for i, (_ws, local_start, local_end) in enumerate(batch_windows):
+                    scored_nll = nll[i, local_start:local_end].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(local_end - local_start)
+                    tgt = y_batch[i, local_start:local_end]
+                    prev = x_batch[i, local_start:local_end]
+                    token_bytes = base_bytes_lut[tgt].to(torch.float64)
+                    token_bytes += (
+                        has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]
+                    ).to(torch.float64)
+                    byte_count += token_bytes.sum()
+            if rank == 0 and (chunk_idx % 10 == 0 or chunk_idx == num_chunks - 1):
+                elapsed = time.perf_counter() - t0
+                running_loss = loss_sum.item() / max(token_count.item(), 1.0)
+                running_bpb = (
+                    running_loss / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1.0))
+                    if token_count.item() > 0
+                    else 0.0
+                )
+                log0(f"  sliding_chunk [{chunk_idx + 1}/{num_chunks}] bpb={running_bpb:.6f} time={elapsed:.1f}s")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+    base_model.train()
+    log0(
+        f"sliding_eval:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s"
+    )
     return val_loss, val_bpb
 
 # -----------------------------
@@ -2198,6 +2313,28 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_quantized_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.sliding_eval_enabled:
+        torch.cuda.synchronize()
+        t_sliding = time.perf_counter()
+        sliding_val_loss, sliding_val_bpb = eval_val_sliding(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            stride=args.eval_stride,
+            log0=log0,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"quantized_sliding_no_ttt val_loss:{sliding_val_loss:.4f} val_bpb:{sliding_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_sliding):.0f}ms"
+        )
+        log0(f"quantized_sliding_no_ttt_exact val_loss:{sliding_val_loss:.8f} val_bpb:{sliding_val_bpb:.8f}")
     if args.ttt_enabled:
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
