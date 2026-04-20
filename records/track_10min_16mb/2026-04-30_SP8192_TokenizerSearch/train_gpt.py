@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -250,9 +251,16 @@ class Muon(torch.optim.Optimizer):
 # We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
 # Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
+@dataclass(frozen=True)
+class TokenizerLUTs:
+    base_bytes: Tensor
+    has_leading_space: Tensor
+    is_boundary_token: Tensor
+
+
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> TokenizerLUTs:
     sp_vocab_size = int(sp.vocab_size())
     space_piece_id = int(sp.piece_to_id("▁"))
     if (
@@ -282,10 +290,10 @@ def build_sentencepiece_luts(
             has_leading_space_np[token_id] = True
             piece = piece[1:]
         base_bytes_np[token_id] = len(piece.encode("utf-8"))
-    return (
-        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
-        torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
-        torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+    return TokenizerLUTs(
+        base_bytes=torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+        has_leading_space=torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+        is_boundary_token=torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
 
 
@@ -352,6 +360,54 @@ def validate_batching_args(args: Hyperparameters, world_size: int, grad_accum_st
         )
 
 
+def compute_token_bytes(tgt: Tensor, prev: Tensor, luts: TokenizerLUTs) -> Tensor:
+    # Leading ▁ contributes a byte only when the previous token wasn't itself a boundary,
+    # matching how the validation stream reconstructs whitespace.
+    token_bytes = luts.base_bytes[tgt].to(torch.float64)
+    token_bytes += (luts.has_leading_space[tgt] & ~luts.is_boundary_token[prev]).to(torch.float64)
+    return token_bytes
+
+
+def build_chunk_windows(
+    total_tokens: int, seq_len: int, stride: int, chunk_tokens: int
+) -> tuple[list[list[tuple[int, int, int]]], int]:
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0
+    ]
+    num_chunks = (total_tokens + chunk_tokens - 1) // chunk_tokens
+    chunk_windows: list[list[tuple[int, int, int]]] = [[] for _ in range(num_chunks)]
+    for ws in window_starts:
+        end = min(ws + seq_len, total_tokens)
+        scored_start = 0 if ws == 0 else min(ws + seq_len - stride, total_tokens)
+        if scored_start >= end:
+            continue
+        local_start = scored_start - ws
+        local_end = end - ws
+        chunk_idx = min(scored_start // chunk_tokens, num_chunks - 1)
+        chunk_windows[chunk_idx].append((ws, local_start, local_end))
+    return chunk_windows, len(window_starts)
+
+
+def fill_batch_from_windows(
+    batch_windows: list[tuple[int, int, int]],
+    val_tokens: Tensor,
+    seq_len: int,
+    total_tokens: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    batch_size = len(batch_windows)
+    x_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
+    y_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
+    for i, (ws, _local_start, _local_end) in enumerate(batch_windows):
+        end = min(ws + seq_len, total_tokens)
+        window_len = end - ws
+        chunk_tokens = val_tokens[ws : end + 1].to(dtype=torch.int64, device=device)
+        x_batch[i, :window_len] = chunk_tokens[:-1]
+        y_batch[i, :window_len] = chunk_tokens[1:]
+    return x_batch, y_batch
+
+
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -360,9 +416,7 @@ def eval_val(
     device: torch.device,
     grad_accum_steps: int,
     val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
+    luts: TokenizerLUTs,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -401,11 +455,7 @@ def eval_val(
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+            val_byte_count += compute_token_bytes(y.reshape(-1), x.reshape(-1), luts).sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -429,9 +479,7 @@ def eval_val_sliding_ttt(
     world_size: int,
     device: torch.device,
     val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
+    luts: TokenizerLUTs,
     stride: int,
     log0=print,
 ) -> tuple[float, float]:
@@ -449,25 +497,12 @@ def eval_val_sliding_ttt(
     if args.ttt_epochs < 0:
         raise ValueError(f"TTT_EPOCHS must be non-negative, got {args.ttt_epochs}")
 
-    window_starts = [
-        ws for ws in range(0, total_tokens, stride)
-        if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0
-    ]
-    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
-    chunk_windows: list[list[tuple[int, int, int]]] = [[] for _ in range(num_chunks)]
-    for ws in window_starts:
-        end = min(ws + seq_len, total_tokens)
-        scored_start = 0 if ws == 0 else min(ws + seq_len - stride, total_tokens)
-        if scored_start >= end:
-            continue
-        local_start = scored_start - ws
-        local_end = end - ws
-        chunk_idx = min(scored_start // ttt_chunk, num_chunks - 1)
-        chunk_windows[chunk_idx].append((ws, local_start, local_end))
+    chunk_windows, total_windows = build_chunk_windows(total_tokens, seq_len, stride, ttt_chunk)
+    num_chunks = len(chunk_windows)
 
     log0(
         f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
-        f"total_windows={len(window_starts)} stride={stride} "
+        f"total_windows={total_windows} stride={stride} "
         f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
         f"freeze_blocks={args.ttt_freeze_blocks}"
     )
@@ -508,14 +543,9 @@ def eval_val_sliding_ttt(
             for batch_start in range(0, len(my_windows), args.ttt_batch_seqs):
                 batch_windows = my_windows[batch_start : batch_start + args.ttt_batch_seqs]
                 batch_size = len(batch_windows)
-                x_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
-                y_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
-                for i, (ws, local_start, local_end) in enumerate(batch_windows):
-                    end = min(ws + seq_len, total_tokens)
-                    window_len = end - ws
-                    chunk_tokens = val_tokens[ws : end + 1].to(dtype=torch.int64, device=device)
-                    x_batch[i, :window_len] = chunk_tokens[:-1]
-                    y_batch[i, :window_len] = chunk_tokens[1:]
+                x_batch, y_batch = fill_batch_from_windows(
+                    batch_windows, val_tokens, seq_len, total_tokens, device
+                )
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     logits = base_model.forward_logits(x_batch).reshape(batch_size, seq_len, -1)
                 nll = F.cross_entropy(
@@ -524,16 +554,13 @@ def eval_val_sliding_ttt(
                     reduction="none",
                 ).reshape(batch_size, seq_len)
                 for i, (_ws, local_start, local_end) in enumerate(batch_windows):
-                    scored_nll = nll[i, local_start:local_end].to(torch.float64)
-                    loss_sum += scored_nll.sum()
+                    loss_sum += nll[i, local_start:local_end].to(torch.float64).sum()
                     token_count += float(local_end - local_start)
-                    tgt = y_batch[i, local_start:local_end]
-                    prev = x_batch[i, local_start:local_end]
-                    token_bytes = base_bytes_lut[tgt].to(torch.float64)
-                    token_bytes += (
-                        has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]
-                    ).to(torch.float64)
-                    byte_count += token_bytes.sum()
+                    byte_count += compute_token_bytes(
+                        y_batch[i, local_start:local_end],
+                        x_batch[i, local_start:local_end],
+                        luts,
+                    ).sum()
 
         is_last_chunk = chunk_idx == num_chunks - 1
         if not is_last_chunk and args.ttt_epochs > 0:
@@ -609,9 +636,7 @@ def eval_val_sliding(
     world_size: int,
     device: torch.device,
     val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
+    luts: TokenizerLUTs,
     stride: int,
     log0=print,
 ) -> tuple[float, float]:
@@ -626,25 +651,14 @@ def eval_val_sliding(
     if args.sliding_batch_seqs <= 0:
         raise ValueError(f"SLIDING_BATCH_SEQS must be positive, got {args.sliding_batch_seqs}")
 
-    window_starts = [
-        ws for ws in range(0, total_tokens, stride)
-        if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0
-    ]
-    num_chunks = (total_tokens + args.sliding_chunk_tokens - 1) // args.sliding_chunk_tokens
-    chunk_windows: list[list[tuple[int, int, int]]] = [[] for _ in range(num_chunks)]
-    for ws in window_starts:
-        end = min(ws + seq_len, total_tokens)
-        scored_start = 0 if ws == 0 else min(ws + seq_len - stride, total_tokens)
-        if scored_start >= end:
-            continue
-        local_start = scored_start - ws
-        local_end = end - ws
-        chunk_idx = min(scored_start // args.sliding_chunk_tokens, num_chunks - 1)
-        chunk_windows[chunk_idx].append((ws, local_start, local_end))
+    chunk_windows, total_windows = build_chunk_windows(
+        total_tokens, seq_len, stride, args.sliding_chunk_tokens
+    )
+    num_chunks = len(chunk_windows)
 
     log0(
         f"sliding_eval:start chunks={num_chunks} chunk_tokens={args.sliding_chunk_tokens} "
-        f"total_windows={len(window_starts)} stride={stride} batch_seqs={args.sliding_batch_seqs}"
+        f"total_windows={total_windows} stride={stride} batch_seqs={args.sliding_batch_seqs}"
     )
     reset_rotary_caches(base_model)
 
@@ -664,14 +678,9 @@ def eval_val_sliding(
             for batch_start in range(0, len(my_windows), args.sliding_batch_seqs):
                 batch_windows = my_windows[batch_start : batch_start + args.sliding_batch_seqs]
                 batch_size = len(batch_windows)
-                x_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
-                y_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
-                for i, (ws, local_start, local_end) in enumerate(batch_windows):
-                    end = min(ws + seq_len, total_tokens)
-                    window_len = end - ws
-                    chunk_tokens = val_tokens[ws : end + 1].to(dtype=torch.int64, device=device)
-                    x_batch[i, :window_len] = chunk_tokens[:-1]
-                    y_batch[i, :window_len] = chunk_tokens[1:]
+                x_batch, y_batch = fill_batch_from_windows(
+                    batch_windows, val_tokens, seq_len, total_tokens, device
+                )
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     logits = base_model.forward_logits(x_batch).reshape(batch_size, seq_len, -1)
                 nll = F.cross_entropy(
@@ -680,16 +689,13 @@ def eval_val_sliding(
                     reduction="none",
                 ).reshape(batch_size, seq_len)
                 for i, (_ws, local_start, local_end) in enumerate(batch_windows):
-                    scored_nll = nll[i, local_start:local_end].to(torch.float64)
-                    loss_sum += scored_nll.sum()
+                    loss_sum += nll[i, local_start:local_end].to(torch.float64).sum()
                     token_count += float(local_end - local_start)
-                    tgt = y_batch[i, local_start:local_end]
-                    prev = x_batch[i, local_start:local_end]
-                    token_bytes = base_bytes_lut[tgt].to(torch.float64)
-                    token_bytes += (
-                        has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]
-                    ).to(torch.float64)
-                    byte_count += token_bytes.sum()
+                    byte_count += compute_token_bytes(
+                        y_batch[i, local_start:local_end],
+                        x_batch[i, local_start:local_end],
+                        luts,
+                    ).sum()
             if rank == 0 and (chunk_idx % 10 == 0 or chunk_idx == num_chunks - 1):
                 elapsed = time.perf_counter() - t0
                 running_loss = loss_sum.item() / max(token_count.item(), 1.0)
@@ -1885,9 +1891,7 @@ def main() -> None:
         )
     dataset_name, actual_train_files = validate_dataset_tokenizer_pair(args.data_path, args.tokenizer_path)
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
+    luts = build_sentencepiece_luts(sp, args.vocab_size, device)
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -2058,10 +2062,8 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
-    if args.warmup_steps > 0:
-        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
-        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        model.train()
+    def _run_warmup(label: str, looping_active: bool) -> None:
+        base_model.looping_active = looping_active
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -2075,26 +2077,18 @@ def main() -> None:
                 opt.step()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                log0(f"{label}:{warmup_step + 1}/{args.warmup_steps}")
+
+    if args.warmup_steps > 0:
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        model.train()
+        _run_warmup("warmup_step", looping_active=False)
         if args.num_loops > 0:
-            base_model.looping_active = True
             log0(
                 f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
-            for warmup_step in range(args.warmup_steps):
-                zero_grad_all()
-                for micro_step in range(grad_accum_steps):
-                    if distributed:
-                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        warmup_loss = model(x, y)
-                    (warmup_loss * grad_scale).backward()
-                for opt in optimizers:
-                    opt.step()
-                zero_grad_all()
-                if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                    log0(f"loop_warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            _run_warmup("loop_warmup_step", looping_active=True)
             base_model.looping_active = False
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
@@ -2140,9 +2134,7 @@ def main() -> None:
                 device,
                 grad_accum_steps,
                 val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
+                luts,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -2202,7 +2194,9 @@ def main() -> None:
                 for name, tensor in base_model.state_dict().items():
                     ema_tensor = ema_state[name]
                     if ema_tensor.is_floating_point() and tensor.is_floating_point():
-                        ema_tensor.mul_(args.ema_decay).add_(tensor.detach().float(), alpha=1.0 - args.ema_decay)
+                        # EMA is held in fp32 for numerical stability; only up-cast bf16 source.
+                        src = tensor.detach() if tensor.dtype == ema_tensor.dtype else tensor.detach().to(ema_tensor.dtype)
+                        ema_tensor.mul_(args.ema_decay).add_(src, alpha=1.0 - args.ema_decay)
                     else:
                         ema_tensor.copy_(tensor.detach())
         zero_grad_all()
@@ -2255,9 +2249,7 @@ def main() -> None:
         device,
         grad_accum_steps,
         val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
+        luts,
     )
     torch.cuda.synchronize()
     log0(
@@ -2359,9 +2351,7 @@ def main() -> None:
         device,
         grad_accum_steps,
         val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
+        luts,
     )
     torch.cuda.synchronize()
     log0(
@@ -2379,9 +2369,7 @@ def main() -> None:
             world_size,
             device,
             val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
+            luts,
             stride=args.eval_stride,
             log0=log0,
         )
@@ -2401,9 +2389,7 @@ def main() -> None:
             world_size,
             device,
             val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
+            luts,
             stride=args.eval_stride,
             log0=log0,
         )
