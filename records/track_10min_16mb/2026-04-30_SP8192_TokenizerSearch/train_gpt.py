@@ -74,6 +74,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
+    parallel_residual = bool(int(os.environ.get("PARALLEL_RESIDUAL", "1")))
+    parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 7))
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
     loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
@@ -1621,6 +1623,7 @@ class Block(nn.Module):
         negative_slope: float,
         layer_idx: int,
         ln_scale: bool,
+        parallel_residual: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1639,14 +1642,16 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.parallel_residual = parallel_residual
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        mlp_in = x_in if self.parallel_residual else x_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(
-            self.mlp_norm(x_out) * self.ln_scale_factor
+            self.mlp_norm(mlp_in) * self.ln_scale_factor
         )
         return x_out
 
@@ -1667,6 +1672,8 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         xsa_last_n: int,
+        parallel_residual: bool,
+        parallel_start_layer: int,
         num_loops: int,
         loop_start: int,
         loop_end: int,
@@ -1698,6 +1705,7 @@ class GPT(nn.Module):
                     negative_slope,
                     i,
                     ln_scale,
+                    parallel_residual and i >= parallel_start_layer,
                 )
                 for i in range(num_layers)
             ]
@@ -1902,6 +1910,8 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         xsa_last_n=args.xsa_last_n,
+        parallel_residual=args.parallel_residual,
+        parallel_start_layer=args.parallel_start_layer,
         num_loops=args.num_loops,
         loop_start=args.loop_start,
         loop_end=args.loop_end,
@@ -1979,6 +1989,11 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     xsa_layers = [i for i, block in enumerate(base_model.blocks) if block.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    parallel_layers = [i for i, block in enumerate(base_model.blocks) if block.parallel_residual]
+    log0(
+        f"parallel_residual:active={int(args.parallel_residual)} "
+        f"start_layer:{args.parallel_start_layer} active_layers:{parallel_layers}"
+    )
     if args.num_loops > 0:
         log0(
             f"layer_loop:planned start:{args.loop_start} end:{args.loop_end} repeats:{args.num_loops} "
