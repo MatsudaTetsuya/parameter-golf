@@ -103,15 +103,20 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
-    adam_wd = float(os.environ.get("ADAM_WD", 0.095))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.02))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
-    embed_wd = float(os.environ.get("EMBED_WD", 0.095))
+    embed_wd = float(os.environ.get("EMBED_WD", 0.085))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
 
     # Quantization & compression.
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     gptq_calibration_shuffled = bool(int(os.environ.get("GPTQ_CALIBRATION_SHUFFLED", "1")))
+    quant_pack_int6 = bool(int(os.environ.get("QUANT_PACK_INT6", "0")))
+    quant_split_artifact = bool(int(os.environ.get("QUANT_SPLIT_ARTIFACT", "0")))
+    quant_byte_shuffle_strides = tuple(
+        int(x) for x in os.environ.get("QUANT_BYTE_SHUFFLE_STRIDES", "1,2").split(",") if x.strip()
+    )
     quant_packed_byte_shuffle_strides = tuple(
         int(x) for x in os.environ.get("QUANT_PACKED_BYTE_SHUFFLE_STRIDES", "1,3").split(",") if x.strip()
     )
@@ -967,7 +972,7 @@ def gptq_mixed_quantize(
             clip_sigmas=clip_sigmas,
             clip_range=2 ** (bits - 1) - 1,
         )
-        packed = bits == 6
+        packed = bits == 6 and args.quant_pack_int6
         q_storage = pack_int6_signed(q) if packed else q
         result[name + ".q"] = q_storage
         result[name + ".scale"] = scale
@@ -1180,9 +1185,33 @@ def serialize_quantized_artifact(
     meta: dict[str, dict[str, object]],
     runtime_meta: dict[str, object],
     compressor: str,
+    split_artifact: bool,
+    candidate_strides: tuple[int, ...],
     packed_candidate_strides: tuple[int, ...],
     aux_candidate_strides: tuple[int, ...],
 ) -> tuple[bytes, dict[str, object]]:
+    if not split_artifact:
+        quant_buf = io.BytesIO()
+        torch.save({"w": result, "m": meta, "r": runtime_meta}, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob, quant_stride, quant_sizes = _compress_best(
+            quant_raw,
+            compressor,
+            candidate_strides,
+        )
+        return quant_blob, {
+            "artifact_mode": "single",
+            "raw_torch_bytes": len(quant_raw),
+            "packed_raw_bytes": 0,
+            "aux_raw_bytes": len(quant_raw),
+            "packed_stride": 1,
+            "aux_stride": quant_stride,
+            "packed_candidate_sizes": {},
+            "aux_candidate_sizes": quant_sizes,
+            "single_candidate_sizes": quant_sizes,
+            "has_packed_blob": False,
+        }
+
     packed_result, aux_result = _split_quantized_tensors(result, meta)
 
     packed_raw = b""
@@ -1209,6 +1238,8 @@ def serialize_quantized_artifact(
     )
     artifact_bytes = _pack_split_artifact(packed_blob, aux_blob, compressor)
     return artifact_bytes, {
+        "artifact_mode": "split",
+        "raw_torch_bytes": len(packed_raw) + len(aux_raw),
         "packed_raw_bytes": len(packed_raw),
         "aux_raw_bytes": len(aux_raw),
         "packed_stride": packed_stride,
@@ -1242,7 +1273,7 @@ def load_quantized_artifact(
         return result, aux_state["m"], dict(aux_state.get("r") or {})
 
     legacy_state = torch.load(io.BytesIO(_decompress(data, compressor)), map_location="cpu")
-    return legacy_state["w"], legacy_state["m"], {}
+    return legacy_state["w"], legacy_state["m"], dict(legacy_state.get("r") or {})
 
 
 # -----------------------------
@@ -1756,8 +1787,12 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+            if not isinstance(module, nn.Linear):
+                continue
+            if getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+            elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
+                nn.init.orthogonal_(module.weight, gain=1.0)
 
     def forward_features(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -2014,6 +2049,10 @@ def main() -> None:
         f"scalar:{args.adam_wd} ema_decay:{args.ema_decay}"
     )
     log0(f"muon_row_normalize:{args.muon_row_normalize}")
+    log0(
+        f"quant_storage packed_int6:{int(args.quant_pack_int6)} "
+        f"split_artifact:{int(args.quant_split_artifact)}"
+    )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -2308,27 +2347,35 @@ def main() -> None:
         quant_meta,
         runtime_meta,
         args.compressor,
+        args.quant_split_artifact,
+        args.quant_byte_shuffle_strides,
         args.quant_packed_byte_shuffle_strides,
         args.quant_aux_byte_shuffle_strides,
     )
-    quant_raw_bytes = int(artifact_stats["packed_raw_bytes"]) + int(artifact_stats["aux_raw_bytes"])
+    quant_raw_bytes = int(artifact_stats["raw_torch_bytes"])
     if master_process:
         with open(args.quantized_model_path, "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize(args.quantized_model_path)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["quantized_payload_bytes"], 1)
-        packed_stride = int(artifact_stats["packed_stride"])
-        aux_stride = int(artifact_stats["aux_stride"])
+        artifact_mode = str(artifact_stats["artifact_mode"])
         log0(
             f"Serialized model quantized+{args.compressor}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['quantized_payload_bytes']} raw_torch:{quant_raw_bytes} "
             f"payload_ratio:{ratio:.2f}x quantized_tensors:{quant_stats['num_quantized_tensors']} "
-            f"packed_stride:{packed_stride} aux_stride:{aux_stride} "
-            f"split_blobs:{int(bool(artifact_stats['has_packed_blob']))})"
+            f"artifact_mode:{artifact_mode} packed_int6:{int(args.quant_pack_int6)})"
         )
-        log0(f"quantized+{args.compressor} packed_candidate_sizes:{artifact_stats['packed_candidate_sizes']}")
-        log0(f"quantized+{args.compressor} aux_candidate_sizes:{artifact_stats['aux_candidate_sizes']}")
+        if artifact_mode == "split":
+            log0(
+                f"quantized+{args.compressor} packed_stride:{artifact_stats['packed_stride']} "
+                f"aux_stride:{artifact_stats['aux_stride']} "
+                f"split_blobs:{int(bool(artifact_stats['has_packed_blob']))}"
+            )
+            log0(f"quantized+{args.compressor} packed_candidate_sizes:{artifact_stats['packed_candidate_sizes']}")
+            log0(f"quantized+{args.compressor} aux_candidate_sizes:{artifact_stats['aux_candidate_sizes']}")
+        else:
+            log0(f"quantized+{args.compressor} candidate_sizes:{artifact_stats['single_candidate_sizes']}")
         log0(f"Total submission size quantized+{args.compressor}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
