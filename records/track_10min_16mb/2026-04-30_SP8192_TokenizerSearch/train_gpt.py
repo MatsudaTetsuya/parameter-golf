@@ -112,6 +112,9 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     gptq_calibration_shuffled = bool(int(os.environ.get("GPTQ_CALIBRATION_SHUFFLED", "1")))
+    gptq_calibration_tokens = int(
+        os.environ.get("GPTQ_CALIBRATION_TOKENS", max(train_batch_tokens, 786_432))
+    )
     quant_pack_int6 = bool(int(os.environ.get("QUANT_PACK_INT6", "0")))
     quant_split_artifact = bool(int(os.environ.get("QUANT_SPLIT_ARTIFACT", "0")))
     quant_byte_shuffle_strides = tuple(
@@ -2058,6 +2061,10 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"gptq_calibration_tokens:{args.gptq_calibration_tokens} "
+        f"gptq_calibration_batches:{args.gptq_calibration_batches}"
+    )
     log0(f"train_loader_mode:{'shuffled' if args.train_shuffled else 'sequential'}")
     log0(f"warmdown_frac:{args.warmdown_frac:.3f} warmdown_iters:{args.warmdown_iters}")
     log0(f"seed:{args.seed}")
@@ -2329,7 +2336,7 @@ def main() -> None:
     hessians = collect_hessians(
         base_model,
         calib_loader,
-        args.train_batch_tokens,
+        args.gptq_calibration_tokens,
         args.train_seq_len,
         grad_accum_steps,
         args.gptq_calibration_batches,
