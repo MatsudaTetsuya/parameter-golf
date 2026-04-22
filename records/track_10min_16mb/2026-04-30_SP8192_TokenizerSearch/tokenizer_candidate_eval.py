@@ -63,7 +63,7 @@ def evaluate_tokenizer_candidate(
     tokenizer_vocab_path: str | Path | None = None,
     tokenizer_asset_paths: tuple[str, ...] = (),
     alpha: float = 0.0,
-    ngram_order: int = 3,
+    ngram_order: int = 5,
     add_k: float = 0.1,
     cache_dir: str | Path | None = None,
 ) -> TokenizerCandidateEvaluation:
@@ -130,7 +130,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-dir", default=None, help="Directory containing search_split.manifest.json")
     parser.add_argument("--split-manifest", default=None, help="Path to search_split.manifest.json")
     parser.add_argument("--cache-dir", default=None, help="Optional directory for persistent evaluation cache")
-    parser.add_argument("--ngram-order", type=int, default=3, help="Backoff n-gram order")
+    parser.add_argument("--ngram-order", type=int, default=5, help="Backoff n-gram order")
     parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
     return parser

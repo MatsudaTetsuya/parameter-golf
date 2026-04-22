@@ -20,7 +20,7 @@ from tokenizer_checks import (
 
 @dataclass(frozen=True)
 class NgramProxyConfig:
-    order: int = 3
+    order: int = 5
     add_k: float = 0.1
 
     def __post_init__(self) -> None:
@@ -36,6 +36,45 @@ class TokenizerScorerConfig:
     ngram: NgramProxyConfig = field(default_factory=NgramProxyConfig)
     text_field: str = "text"
     extra_asset_paths: tuple[str, ...] = ()
+    stream_mode: str = "fullstack_bos"
+    rare_token_freq_threshold: int = 64
+    rare_token_penalty_weight: float = 2.0
+    long_token_byte_threshold: int = 12
+    long_token_penalty_weight: float = 0.05
+    submission_base_bytes: int | None = None
+    submission_limit_bytes: int = 16_000_000
+    submission_guard_bytes: int = 15_950_000
+    submission_penalty_weight: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.stream_mode not in {"fullstack_bos", "legacy_eos"}:
+            raise ValueError(f"unsupported stream_mode {self.stream_mode!r}")
+        if self.rare_token_freq_threshold < 0:
+            raise ValueError(
+                f"rare_token_freq_threshold must be non-negative, got {self.rare_token_freq_threshold}"
+            )
+        if self.rare_token_penalty_weight < 0.0:
+            raise ValueError(
+                f"rare_token_penalty_weight must be non-negative, got {self.rare_token_penalty_weight}"
+            )
+        if self.long_token_byte_threshold < 0:
+            raise ValueError(
+                f"long_token_byte_threshold must be non-negative, got {self.long_token_byte_threshold}"
+            )
+        if self.long_token_penalty_weight < 0.0:
+            raise ValueError(
+                f"long_token_penalty_weight must be non-negative, got {self.long_token_penalty_weight}"
+            )
+        if self.submission_base_bytes is not None and self.submission_base_bytes < 0:
+            raise ValueError(f"submission_base_bytes must be non-negative, got {self.submission_base_bytes}")
+        if self.submission_limit_bytes <= 0:
+            raise ValueError(f"submission_limit_bytes must be positive, got {self.submission_limit_bytes}")
+        if self.submission_guard_bytes <= 0:
+            raise ValueError(f"submission_guard_bytes must be positive, got {self.submission_guard_bytes}")
+        if self.submission_penalty_weight < 0.0:
+            raise ValueError(
+                f"submission_penalty_weight must be non-negative, got {self.submission_penalty_weight}"
+            )
 
 
 @dataclass(frozen=True)
@@ -51,6 +90,11 @@ class TokenizerScoreBreakdown:
     vocab_size: int
     ngram_order: int
     add_k: float
+    stream_mode: str
+    rare_token_mass: float
+    long_token_excess_penalty: float
+    submission_size_proxy_bytes: int | None
+    submission_penalty: float
 
 
 def load_docs(path: str | Path, *, text_field: str = "text") -> list[str]:
@@ -131,20 +175,32 @@ def _bos_context_id(sp: spm.SentencePieceProcessor) -> int:
     return 0
 
 
-def _tokenize_docs(
+def _tokenize_docs_legacy_eos(
     sp: spm.SentencePieceProcessor,
     docs: Iterable[str],
-    *,
-    append_eos: bool = True,
 ) -> list[list[int]]:
     eos_id = int(sp.eos_id())
     sequences: list[list[int]] = []
     for doc in docs:
         tokens = list(sp.encode(doc, out_type=int))
-        if append_eos and eos_id >= 0:
+        if eos_id >= 0:
             tokens.append(eos_id)
         sequences.append(tokens)
     return sequences
+
+
+def _build_fullstack_bos_stream(
+    sp: spm.SentencePieceProcessor,
+    docs: Iterable[str],
+) -> list[int]:
+    bos_id = int(sp.bos_id())
+    if bos_id < 0:
+        raise ValueError("SentencePiece model must define bos_id for fullstack_bos stream mode")
+    stream: list[int] = []
+    for doc in docs:
+        stream.append(bos_id)
+        stream.extend(sp.encode(doc, out_type=int))
+    return stream
 
 
 class AdditiveBackoffNgramLM:
@@ -170,18 +226,17 @@ class AdditiveBackoffNgramLM:
         self.ngram_counts = [Counter() for _ in range(order)]
         self.trained_token_count = 0
 
-    def fit(self, docs: Sequence[Sequence[int]]) -> None:
+    def fit_stream(self, stream: Sequence[int]) -> None:
         prefix = [self.bos_context_id] * (self.order - 1)
-        for doc in docs:
-            padded = prefix + list(doc)
-            for pos in range(self.order - 1, len(padded)):
-                target = padded[pos]
-                history = padded[max(0, pos - self.order + 1) : pos]
-                for context_len in range(self.order):
-                    context = tuple(history[-context_len:]) if context_len else ()
-                    self.context_totals[context_len][context] += 1
-                    self.ngram_counts[context_len][context + (target,)] += 1
-                self.trained_token_count += 1
+        padded = prefix + list(stream)
+        for pos in range(self.order - 1, len(padded)):
+            target = padded[pos]
+            history = padded[max(0, pos - self.order + 1) : pos]
+            for context_len in range(self.order):
+                context = tuple(history[-context_len:]) if context_len else ()
+                self.context_totals[context_len][context] += 1
+                self.ngram_counts[context_len][context + (target,)] += 1
+            self.trained_token_count += 1
 
     def token_probability(self, history: Sequence[int], target: int) -> float:
         if self.trained_token_count <= 0:
@@ -196,17 +251,16 @@ class AdditiveBackoffNgramLM:
                 return float(numerator / denominator)
         raise RuntimeError("unreachable backoff path")
 
-    def average_bits_per_token(self, docs: Sequence[Sequence[int]]) -> float:
+    def average_bits_per_token_stream(self, stream: Sequence[int]) -> float:
         prefix = [self.bos_context_id] * (self.order - 1)
         total_bits = 0.0
         total_tokens = 0
-        for doc in docs:
-            padded = prefix + list(doc)
-            for pos in range(self.order - 1, len(padded)):
-                target = padded[pos]
-                history = padded[max(0, pos - self.order + 1) : pos]
-                total_bits -= math.log2(self.token_probability(history, target))
-                total_tokens += 1
+        padded = prefix + list(stream)
+        for pos in range(self.order - 1, len(padded)):
+            target = padded[pos]
+            history = padded[max(0, pos - self.order + 1) : pos]
+            total_bits -= math.log2(self.token_probability(history, target))
+            total_tokens += 1
         if total_tokens <= 0:
             raise ValueError("holdout token count must be positive")
         return total_bits / total_tokens
@@ -215,6 +269,30 @@ class AdditiveBackoffNgramLM:
 def _count_total_bytes(tokenized_docs: Sequence[Sequence[int]], *, sp: spm.SentencePieceProcessor) -> int:
     lut = build_sentencepiece_byte_lut(sp)
     return sum(count_bytes_from_token_ids(tokens, lut=lut) for tokens in tokenized_docs)
+
+
+def _token_streams_for_mode(
+    sp: spm.SentencePieceProcessor,
+    docs: Sequence[str],
+    *,
+    stream_mode: str,
+) -> tuple[list[int], list[list[int]]]:
+    if stream_mode == "legacy_eos":
+        tokenized_docs = _tokenize_docs_legacy_eos(sp, docs)
+        flat_stream = [token for doc in tokenized_docs for token in doc]
+        return flat_stream, tokenized_docs
+    if stream_mode == "fullstack_bos":
+        flat_stream = _build_fullstack_bos_stream(sp, docs)
+        return flat_stream, [flat_stream]
+    raise ValueError(f"unsupported stream_mode {stream_mode!r}")
+
+
+def _token_byte_lengths_by_id(sp: spm.SentencePieceProcessor) -> list[int]:
+    lut = build_sentencepiece_byte_lut(sp)
+    token_lengths: list[int] = []
+    for token_id in range(int(sp.vocab_size())):
+        token_lengths.append(int(lut.base_bytes[token_id] + int(lut.has_leading_space[token_id])))
+    return token_lengths
 
 
 def score_tokenizer_documents(
@@ -227,10 +305,18 @@ def score_tokenizer_documents(
 ) -> TokenizerScoreBreakdown:
     scorer_config = TokenizerScorerConfig() if config is None else config
     assert_has_standalone_space_token(sp)
-    train_tokens = _tokenize_docs(sp, train_docs, append_eos=True)
-    holdout_tokens = _tokenize_docs(sp, holdout_docs, append_eos=True)
-    train_token_count = sum(len(doc) for doc in train_tokens)
-    holdout_token_count = sum(len(doc) for doc in holdout_tokens)
+    train_stream, train_tokens = _token_streams_for_mode(
+        sp,
+        train_docs,
+        stream_mode=scorer_config.stream_mode,
+    )
+    holdout_stream, holdout_tokens = _token_streams_for_mode(
+        sp,
+        holdout_docs,
+        stream_mode=scorer_config.stream_mode,
+    )
+    train_token_count = len(train_stream)
+    holdout_token_count = len(holdout_stream)
     if train_token_count <= 0:
         raise ValueError("train token count must be positive")
     if holdout_token_count <= 0:
@@ -244,11 +330,44 @@ def score_tokenizer_documents(
         add_k=scorer_config.ngram.add_k,
         bos_context_id=_bos_context_id(sp),
     )
-    ngram.fit(train_tokens)
-    proxy_bits_per_token = ngram.average_bits_per_token(holdout_tokens)
+    ngram.fit_stream(train_stream)
+    proxy_bits_per_token = ngram.average_bits_per_token_stream(holdout_stream)
     holdout_tokens_per_byte = holdout_token_count / holdout_byte_count
     proxy_bpb_holdout = proxy_bits_per_token * holdout_tokens_per_byte
-    score = proxy_bpb_holdout + scorer_config.alpha * tokenizer_asset_bytes
+    train_token_counts = Counter(train_stream)
+    holdout_token_counts = Counter(holdout_stream)
+    rare_token_mass = 0.0
+    if scorer_config.rare_token_freq_threshold > 0 and holdout_token_count > 0:
+        rare_token_mass = (
+            sum(
+                count
+                for token_id, count in holdout_token_counts.items()
+                if train_token_counts.get(token_id, 0) < scorer_config.rare_token_freq_threshold
+            )
+            / holdout_token_count
+        )
+    token_byte_lengths = _token_byte_lengths_by_id(sp)
+    long_token_excess_penalty = 0.0
+    if scorer_config.long_token_penalty_weight > 0.0 and holdout_token_count > 0:
+        long_token_excess_penalty = sum(
+            (count / holdout_token_count)
+            * max(0, token_byte_lengths[token_id] - scorer_config.long_token_byte_threshold) ** 2
+            for token_id, count in holdout_token_counts.items()
+            if 0 <= token_id < len(token_byte_lengths)
+        )
+    submission_size_proxy_bytes = None
+    submission_penalty = 0.0
+    if scorer_config.submission_base_bytes is not None:
+        submission_size_proxy_bytes = scorer_config.submission_base_bytes + tokenizer_asset_bytes
+        overflow = max(0, submission_size_proxy_bytes - scorer_config.submission_guard_bytes)
+        submission_penalty = scorer_config.submission_penalty_weight * float(overflow**2)
+    score = (
+        proxy_bpb_holdout
+        + scorer_config.alpha * tokenizer_asset_bytes
+        + scorer_config.rare_token_penalty_weight * rare_token_mass
+        + scorer_config.long_token_penalty_weight * long_token_excess_penalty
+        + submission_penalty
+    )
     return TokenizerScoreBreakdown(
         proxy_bits_per_token=proxy_bits_per_token,
         holdout_tokens_per_byte=holdout_tokens_per_byte,
@@ -261,6 +380,11 @@ def score_tokenizer_documents(
         vocab_size=int(sp.vocab_size()),
         ngram_order=scorer_config.ngram.order,
         add_k=scorer_config.ngram.add_k,
+        stream_mode=scorer_config.stream_mode,
+        rare_token_mass=rare_token_mass,
+        long_token_excess_penalty=long_token_excess_penalty,
+        submission_size_proxy_bytes=submission_size_proxy_bytes,
+        submission_penalty=submission_penalty,
     )
 
 
@@ -298,9 +422,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-docs", required=True, help="Train docs path (.txt or .jsonl)")
     parser.add_argument("--holdout-docs", required=True, help="Holdout docs path (.txt or .jsonl)")
     parser.add_argument("--text-field", default="text", help="JSONL text field name")
-    parser.add_argument("--ngram-order", type=int, default=3, help="Backoff n-gram order")
+    parser.add_argument("--ngram-order", type=int, default=5, help="Backoff n-gram order")
     parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
+    parser.add_argument(
+        "--stream-mode",
+        choices=("fullstack_bos", "legacy_eos"),
+        default="fullstack_bos",
+        help="Token stream construction mode for proxy scoring",
+    )
+    parser.add_argument("--rare-token-freq-threshold", type=int, default=64, help="Train-frequency threshold for rare-token mass")
+    parser.add_argument("--rare-token-penalty-weight", type=float, default=2.0, help="Penalty weight on holdout mass assigned to rare train tokens")
+    parser.add_argument("--long-token-byte-threshold", type=int, default=12, help="Byte-length threshold above which tokens are penalized")
+    parser.add_argument("--long-token-penalty-weight", type=float, default=0.05, help="Penalty weight on holdout mass assigned to overly long tokens")
+    parser.add_argument("--submission-base-bytes", type=int, default=None, help="Optional fixed base submission bytes used for budget-aware penalty")
+    parser.add_argument("--submission-limit-bytes", type=int, default=16_000_000, help="Submission byte cap")
+    parser.add_argument("--submission-guard-bytes", type=int, default=15_950_000, help="Guard-band submission byte cap")
+    parser.add_argument("--submission-penalty-weight", type=float, default=0.0, help="Quadratic penalty weight for submission budget overflow")
     return parser
 
 
@@ -316,6 +454,15 @@ def main() -> None:
             ngram=NgramProxyConfig(order=args.ngram_order, add_k=args.add_k),
             text_field=args.text_field,
             extra_asset_paths=tuple(args.tokenizer_asset),
+            stream_mode=args.stream_mode,
+            rare_token_freq_threshold=args.rare_token_freq_threshold,
+            rare_token_penalty_weight=args.rare_token_penalty_weight,
+            long_token_byte_threshold=args.long_token_byte_threshold,
+            long_token_penalty_weight=args.long_token_penalty_weight,
+            submission_base_bytes=args.submission_base_bytes,
+            submission_limit_bytes=args.submission_limit_bytes,
+            submission_guard_bytes=args.submission_guard_bytes,
+            submission_penalty_weight=args.submission_penalty_weight,
         ),
     )
     print(json.dumps(asdict(result), indent=2, sort_keys=True))

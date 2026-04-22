@@ -65,6 +65,9 @@ class TokenizerScorerTest(unittest.TestCase):
         config = TokenizerScorerConfig(
             alpha=1e-6,
             ngram=NgramProxyConfig(order=3, add_k=0.1),
+            stream_mode="fullstack_bos",
+            rare_token_penalty_weight=0.0,
+            long_token_penalty_weight=0.0,
         )
         result = score_tokenizer_documents(
             sp,
@@ -103,6 +106,9 @@ class TokenizerScorerTest(unittest.TestCase):
         config = TokenizerScorerConfig(
             alpha=0.0,
             ngram=NgramProxyConfig(order=3, add_k=0.1),
+            stream_mode="fullstack_bos",
+            rare_token_penalty_weight=0.0,
+            long_token_penalty_weight=0.0,
         )
         in_domain = score_tokenizer_documents(
             sp,
@@ -134,6 +140,66 @@ class TokenizerScorerTest(unittest.TestCase):
         )
         self.assertLess(in_domain.proxy_bits_per_token, out_of_domain.proxy_bits_per_token)
         self.assertLess(in_domain.proxy_bpb_holdout, out_of_domain.proxy_bpb_holdout)
+
+    def test_fullstack_bos_stream_counts_bos_without_eos(self) -> None:
+        model_path, sp = self._train_bpe_model(
+            "hello world\nhello again\n",
+        )
+        tokenizer_asset_bytes = measure_tokenizer_asset_bytes(model_path)
+        result = score_tokenizer_documents(
+            sp,
+            train_docs=["hello world", "hello again"],
+            holdout_docs=["hello world"],
+            tokenizer_asset_bytes=tokenizer_asset_bytes,
+            config=TokenizerScorerConfig(
+                alpha=0.0,
+                stream_mode="fullstack_bos",
+                rare_token_penalty_weight=0.0,
+                long_token_penalty_weight=0.0,
+            ),
+        )
+        bos_id = int(sp.bos_id())
+        expected_holdout_count = 1 + len(sp.encode("hello world", out_type=int))
+        self.assertEqual(result.stream_mode, "fullstack_bos")
+        self.assertEqual(result.holdout_token_count, expected_holdout_count)
+        self.assertGreaterEqual(bos_id, 0)
+
+    def test_penalties_raise_score_for_rare_and_long_tokens(self) -> None:
+        model_path, sp = self._train_bpe_model(
+            "common text\ncommon text\ncommon text\n",
+            vocab_size=48,
+        )
+        tokenizer_asset_bytes = measure_tokenizer_asset_bytes(model_path)
+        base = score_tokenizer_documents(
+            sp,
+            train_docs=["common text", "common text", "common text"],
+            holdout_docs=["common text"],
+            tokenizer_asset_bytes=tokenizer_asset_bytes,
+            config=TokenizerScorerConfig(
+                alpha=0.0,
+                stream_mode="fullstack_bos",
+                rare_token_penalty_weight=0.0,
+                long_token_penalty_weight=0.0,
+            ),
+        )
+        penalized = score_tokenizer_documents(
+            sp,
+            train_docs=["common text", "common text", "common text"],
+            holdout_docs=["rare uncommon_token_fragment"],
+            tokenizer_asset_bytes=tokenizer_asset_bytes,
+            config=TokenizerScorerConfig(
+                alpha=0.0,
+                stream_mode="fullstack_bos",
+                rare_token_freq_threshold=64,
+                rare_token_penalty_weight=2.0,
+                long_token_byte_threshold=4,
+                long_token_penalty_weight=0.05,
+            ),
+        )
+        self.assertGreater(penalized.rare_token_mass, 0.0)
+        self.assertGreaterEqual(penalized.long_token_excess_penalty, 0.0)
+        self.assertGreater(penalized.score, penalized.proxy_bpb_holdout)
+        self.assertGreater(penalized.score, base.score)
 
 
 if __name__ == "__main__":

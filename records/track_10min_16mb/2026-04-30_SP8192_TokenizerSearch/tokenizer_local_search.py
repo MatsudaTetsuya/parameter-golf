@@ -19,7 +19,7 @@ from tokenizer_search_split import SEARCH_SPLIT_MANIFEST_FILENAME, load_search_s
 @dataclass(frozen=True)
 class FixedVocabLocalSearchConfig:
     alpha: float = 0.0
-    ngram_order: int = 3
+    ngram_order: int = 5
     add_k: float = 0.1
     max_steps: int = 4
     beam_width: int = 1
@@ -444,7 +444,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True, help="Directory for generated candidate models and search reports")
     parser.add_argument("--cache-dir", default=None, help="Optional directory for persistent evaluation cache")
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
-    parser.add_argument("--ngram-order", type=int, default=3, help="Backoff n-gram order")
+    parser.add_argument("--ngram-order", type=int, default=5, help="Backoff n-gram order")
     parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
     parser.add_argument("--max-steps", type=int, default=4, help="Maximum local-search steps")
     parser.add_argument("--beam-width", type=int, default=1, help="Beam width")
