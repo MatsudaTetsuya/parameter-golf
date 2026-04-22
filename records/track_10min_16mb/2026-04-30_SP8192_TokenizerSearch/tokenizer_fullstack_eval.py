@@ -30,10 +30,35 @@ STEP_VAL_RE = re.compile(
     r"step:(?P<step>\d+)/(?P<iterations>\d+)\s+val_loss:(?P<val_loss>[0-9eE+.\-]+)\s+val_bpb:(?P<val_bpb>[0-9eE+.\-]+)"
 )
 FINAL_ROUNDTRIP_RE = re.compile(
-    r"final_int8_zlib_roundtrip(?:_exact)?\s+val_loss:(?P<val_loss>[0-9eE+.\-]+)\s+val_bpb:(?P<val_bpb>[0-9eE+.\-]+)"
+    r"(?:final_quantized_roundtrip|final_int8_zlib_roundtrip)(?:_exact)?\s+"
+    r"val_loss:(?P<val_loss>[0-9eE+.\-]+)\s+val_bpb:(?P<val_bpb>[0-9eE+.\-]+)"
+)
+SLIDING_NO_TTT_RE = re.compile(
+    r"quantized_sliding_no_ttt(?:_exact)?\s+val_loss:(?P<val_loss>[0-9eE+.\-]+)\s+val_bpb:(?P<val_bpb>[0-9eE+.\-]+)"
+)
+LEGAL_TTT_RE = re.compile(
+    r"legal_ttt(?:_exact)?\s+val_loss:(?P<val_loss>[0-9eE+.\-]+)\s+val_bpb:(?P<val_bpb>[0-9eE+.\-]+)"
 )
 RAW_MODEL_BYTES_RE = re.compile(r"Serialized model:\s+(?P<bytes>\d+)\s+bytes")
-QUANT_MODEL_BYTES_RE = re.compile(r"Serialized model int8\+zlib:\s+(?P<bytes>\d+)\s+bytes")
+QUANT_MODEL_BYTES_RE = re.compile(
+    r"(?:Serialized model quantized\+[A-Za-z0-9_+-]+|Serialized model int8\+zlib):\s+(?P<bytes>\d+)\s+bytes"
+)
+TOTAL_SUBMISSION_BYTES_RE = re.compile(
+    r"Total submission size (?:quantized\+[A-Za-z0-9_+-]+|int8\+zlib):\s+(?P<bytes>\d+)\s+bytes"
+)
+
+BASELINE_PROFILE_LOCAL_4090 = "sp8192_local_4090"
+BASELINE_PROFILE_ENVS = {
+    BASELINE_PROFILE_LOCAL_4090: {
+        "SEED": "42",
+        "TRAIN_BATCH_TOKENS": "131072",
+        "VAL_BATCH_SIZE": "131072",
+        "MAX_WALLCLOCK_SECONDS": "10800",
+        "GPTQ_RESERVE_SECONDS": "600",
+        "TTT_ENABLED": "0",
+        "SLIDING_EVAL_ENABLED": "1",
+    }
+}
 
 
 @dataclass(frozen=True)
@@ -72,12 +97,15 @@ class FullStackEvalConfig:
     python_executable: str = sys.executable
     script_args: tuple[str, ...] = ()
     env_overrides: dict[str, str] | None = None
+    baseline_profile: str | None = None
 
     def __post_init__(self) -> None:
         if self.launcher not in {"python", "torchrun"}:
             raise ValueError(f"unsupported launcher {self.launcher!r}")
         if self.nproc_per_node <= 0:
             raise ValueError(f"nproc_per_node must be positive, got {self.nproc_per_node}")
+        if self.baseline_profile is not None and self.baseline_profile not in BASELINE_PROFILE_ENVS:
+            raise ValueError(f"unsupported baseline_profile {self.baseline_profile!r}")
 
 
 @dataclass(frozen=True)
@@ -105,8 +133,13 @@ class ParsedTrainLogMetrics:
     last_logged_val_bpb: float | None
     final_roundtrip_val_loss: float | None
     final_roundtrip_val_bpb: float | None
+    sliding_no_ttt_val_loss: float | None
+    sliding_no_ttt_val_bpb: float | None
+    legal_ttt_val_loss: float | None
+    legal_ttt_val_bpb: float | None
     raw_model_bytes_logged: int | None
     quantized_model_bytes_logged: int | None
+    total_submission_bytes_logged: int | None
 
 
 @dataclass(frozen=True)
@@ -136,6 +169,13 @@ class FullStackCandidateResult:
     last_logged_val_bpb: float | None
     final_roundtrip_val_loss: float | None
     final_roundtrip_val_bpb: float | None
+    sliding_no_ttt_val_loss: float | None
+    sliding_no_ttt_val_bpb: float | None
+    legal_ttt_val_loss: float | None
+    legal_ttt_val_bpb: float | None
+    primary_metric_name: str
+    primary_metric_val_loss: float | None
+    primary_metric_val_bpb: float | None
 
 
 @dataclass(frozen=True)
@@ -143,6 +183,12 @@ class FullStackEvalReport:
     config: FullStackEvalConfig
     candidates: list[FullStackCandidateSpec]
     results: list[FullStackCandidateResult]
+
+
+def baseline_profile_env(profile: str | None) -> dict[str, str]:
+    if profile is None:
+        return {}
+    return dict(BASELINE_PROFILE_ENVS[profile])
 
 
 def sanitize_label(label: str) -> str:
@@ -541,6 +587,16 @@ def build_fullstack_command(
     ]
 
 
+def select_primary_metric(
+    parsed: ParsedTrainLogMetrics,
+) -> tuple[str, float | None, float | None]:
+    if parsed.sliding_no_ttt_val_bpb is not None:
+        return ("quantized_sliding_no_ttt_exact", parsed.sliding_no_ttt_val_loss, parsed.sliding_no_ttt_val_bpb)
+    if parsed.final_roundtrip_val_bpb is not None:
+        return ("final_quantized_roundtrip_exact", parsed.final_roundtrip_val_loss, parsed.final_roundtrip_val_bpb)
+    return ("last_logged_val_bpb", parsed.last_logged_val_loss, parsed.last_logged_val_bpb)
+
+
 def parse_train_log_metrics(text: str) -> ParsedTrainLogMetrics:
     last_step = None
     last_val_loss = None
@@ -558,16 +614,38 @@ def parse_train_log_metrics(text: str) -> ParsedTrainLogMetrics:
         final_val_loss = float(final_match.group("val_loss"))
         final_val_bpb = float(final_match.group("val_bpb"))
 
+    sliding_matches = list(SLIDING_NO_TTT_RE.finditer(text))
+    sliding_val_loss = None
+    sliding_val_bpb = None
+    if sliding_matches:
+        sliding_match = sliding_matches[-1]
+        sliding_val_loss = float(sliding_match.group("val_loss"))
+        sliding_val_bpb = float(sliding_match.group("val_bpb"))
+
+    ttt_matches = list(LEGAL_TTT_RE.finditer(text))
+    legal_ttt_val_loss = None
+    legal_ttt_val_bpb = None
+    if ttt_matches:
+        ttt_match = ttt_matches[-1]
+        legal_ttt_val_loss = float(ttt_match.group("val_loss"))
+        legal_ttt_val_bpb = float(ttt_match.group("val_bpb"))
+
     raw_matches = list(RAW_MODEL_BYTES_RE.finditer(text))
     quant_matches = list(QUANT_MODEL_BYTES_RE.finditer(text))
+    total_matches = list(TOTAL_SUBMISSION_BYTES_RE.finditer(text))
     return ParsedTrainLogMetrics(
         last_logged_step=last_step,
         last_logged_val_loss=last_val_loss,
         last_logged_val_bpb=last_val_bpb,
         final_roundtrip_val_loss=final_val_loss,
         final_roundtrip_val_bpb=final_val_bpb,
+        sliding_no_ttt_val_loss=sliding_val_loss,
+        sliding_no_ttt_val_bpb=sliding_val_bpb,
+        legal_ttt_val_loss=legal_ttt_val_loss,
+        legal_ttt_val_bpb=legal_ttt_val_bpb,
         raw_model_bytes_logged=None if not raw_matches else int(raw_matches[-1].group("bytes")),
         quantized_model_bytes_logged=None if not quant_matches else int(quant_matches[-1].group("bytes")),
+        total_submission_bytes_logged=None if not total_matches else int(total_matches[-1].group("bytes")),
     )
 
 
@@ -611,6 +689,7 @@ def run_fullstack_evaluation(
         env["DATA_PATH"] = prepared_dataset.dataset_dir
         env["TOKENIZER_PATH"] = prepared_dataset.tokenizer_model_path
         env["VOCAB_SIZE"] = str(prepared_dataset.vocab_size)
+        env.update(baseline_profile_env(config.baseline_profile))
         if config.env_overrides:
             env.update(config.env_overrides)
         command = build_fullstack_command(config=config, train_script_path=train_script_path)
@@ -641,16 +720,22 @@ def run_fullstack_evaluation(
         )
         code_bytes = len(train_script_path.read_text(encoding="utf-8").encode("utf-8"))
         raw_model_path = work_dir / "final_model.pt"
-        quantized_model_path = work_dir / "final_model.int8.ptz"
+        quantized_model_path = work_dir / "final_model.int6.ptz"
+        if not quantized_model_path.is_file():
+            quantized_model_path = work_dir / "final_model.int8.ptz"
         raw_model_bytes = raw_model_path.stat().st_size if raw_model_path.is_file() else parsed.raw_model_bytes_logged
         quantized_model_bytes = (
             quantized_model_path.stat().st_size if quantized_model_path.is_file() else parsed.quantized_model_bytes_logged
         )
         submission_bytes_excluding_tokenizer = None
         submission_bytes_including_tokenizer = None
-        if quantized_model_bytes is not None:
+        if parsed.total_submission_bytes_logged is not None:
+            submission_bytes_excluding_tokenizer = int(parsed.total_submission_bytes_logged)
+            submission_bytes_including_tokenizer = submission_bytes_excluding_tokenizer + tokenizer_asset_bytes
+        elif quantized_model_bytes is not None:
             submission_bytes_excluding_tokenizer = int(quantized_model_bytes) + code_bytes
             submission_bytes_including_tokenizer = submission_bytes_excluding_tokenizer + tokenizer_asset_bytes
+        primary_metric_name, primary_metric_val_loss, primary_metric_val_bpb = select_primary_metric(parsed)
 
         results.append(
             FullStackCandidateResult(
@@ -679,6 +764,13 @@ def run_fullstack_evaluation(
                 last_logged_val_bpb=parsed.last_logged_val_bpb,
                 final_roundtrip_val_loss=parsed.final_roundtrip_val_loss,
                 final_roundtrip_val_bpb=parsed.final_roundtrip_val_bpb,
+                sliding_no_ttt_val_loss=parsed.sliding_no_ttt_val_loss,
+                sliding_no_ttt_val_bpb=parsed.sliding_no_ttt_val_bpb,
+                legal_ttt_val_loss=parsed.legal_ttt_val_loss,
+                legal_ttt_val_bpb=parsed.legal_ttt_val_bpb,
+                primary_metric_name=primary_metric_name,
+                primary_metric_val_loss=primary_metric_val_loss,
+                primary_metric_val_bpb=primary_metric_val_bpb,
             )
         )
     return FullStackEvalReport(config=config, candidates=candidates, results=results)
@@ -700,6 +792,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python-executable", default=sys.executable, help="Python executable for launcher=python")
     parser.add_argument("--script-arg", action="append", default=[], help="Extra positional argument for the train script")
     parser.add_argument("--env", action="append", default=[], help="Environment override in KEY=VALUE form")
+    parser.add_argument(
+        "--baseline-profile",
+        choices=tuple(BASELINE_PROFILE_ENVS.keys()),
+        default=None,
+        help="Apply a predefined env profile for the current baseline stack",
+    )
     return parser
 
 
@@ -723,6 +821,7 @@ def main() -> None:
             python_executable=args.python_executable,
             script_args=tuple(args.script_arg),
             env_overrides=parse_key_value_pairs(args.env),
+            baseline_profile=args.baseline_profile,
         ),
     )
     print(json.dumps(asdict(report), indent=2, sort_keys=True))

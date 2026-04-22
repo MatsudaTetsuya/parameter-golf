@@ -9,8 +9,10 @@ from pathlib import Path
 import sentencepiece as spm
 
 from tokenizer_fullstack_eval import (
+    BASELINE_PROFILE_LOCAL_4090,
     FullStackCandidateSpec,
     FullStackEvalConfig,
+    baseline_profile_env,
     load_fullstack_candidates,
     parse_train_log_metrics,
     prepare_candidate_dataset,
@@ -81,19 +83,25 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
                     "data_path": str(data_path),
                     "tokenizer_path": str(tokenizer_path),
                     "vocab_size": vocab_size,
+                    "train_batch_tokens": os.environ.get("TRAIN_BATCH_TOKENS"),
+                    "sliding_eval_enabled": os.environ.get("SLIDING_EVAL_ENABLED"),
+                    "ttt_enabled": os.environ.get("TTT_ENABLED"),
                     "train_files": sorted(p.name for p in data_path.glob("fineweb_train_*.bin")),
                     "val_files": sorted(p.name for p in data_path.glob("fineweb_val_*.bin")),
                 }
                 Path("dataset_snapshot.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
                 Path("final_model.pt").write_bytes(b"R" * 19)
-                Path("final_model.int8.ptz").write_bytes(b"Q" * 11)
+                Path("final_model.int6.ptz").write_bytes(b"Q" * 11)
 
                 lines = [
                     f"step:0/5 val_loss:2.0000 val_bpb:1.4000 train_time:0ms step_avg:0.00ms",
                     f"Serialized model: 19 bytes",
-                    f"Serialized model int8+zlib: 11 bytes",
-                    f"final_int8_zlib_roundtrip val_loss:1.5000 val_bpb:1.3000 eval_time:1ms",
-                    f"final_int8_zlib_roundtrip_exact val_loss:1.50000000 val_bpb:1.30000000",
+                    f"Serialized model quantized+brotli: 11 bytes",
+                    f"Total submission size quantized+brotli: 111 bytes",
+                    f"final_quantized_roundtrip val_loss:1.5000 val_bpb:1.3000 eval_time:1ms",
+                    f"final_quantized_roundtrip_exact val_loss:1.50000000 val_bpb:1.30000000",
+                    f"quantized_sliding_no_ttt val_loss:1.4000 val_bpb:1.2000 eval_time:1ms",
+                    f"quantized_sliding_no_ttt_exact val_loss:1.40000000 val_bpb:1.20000000",
                 ]
                 log_path.write_text("\\n".join(lines) + "\\n", encoding="utf-8")
                 for line in lines:
@@ -111,16 +119,28 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
                     "step:0/5 val_loss:2.1000 val_bpb:1.4100 train_time:0ms step_avg:0.00ms",
                     "step:5/5 val_loss:1.9000 val_bpb:1.2200 train_time:1ms step_avg:0.20ms",
                     "Serialized model: 19 bytes",
-                    "Serialized model int8+zlib: 11 bytes",
-                    "final_int8_zlib_roundtrip_exact val_loss:1.80000000 val_bpb:1.11111111",
+                    "Serialized model quantized+brotli: 11 bytes",
+                    "Total submission size quantized+brotli: 111 bytes",
+                    "final_quantized_roundtrip_exact val_loss:1.80000000 val_bpb:1.11111111",
+                    "quantized_sliding_no_ttt_exact val_loss:1.70000000 val_bpb:1.00000000",
+                    "legal_ttt_exact val_loss:1.65000000 val_bpb:0.99000000",
                 ]
             )
         )
         self.assertEqual(metrics.last_logged_step, 5)
         self.assertAlmostEqual(metrics.last_logged_val_bpb or 0.0, 1.22)
         self.assertAlmostEqual(metrics.final_roundtrip_val_bpb or 0.0, 1.11111111)
+        self.assertAlmostEqual(metrics.sliding_no_ttt_val_bpb or 0.0, 1.0)
+        self.assertAlmostEqual(metrics.legal_ttt_val_bpb or 0.0, 0.99)
         self.assertEqual(metrics.raw_model_bytes_logged, 19)
         self.assertEqual(metrics.quantized_model_bytes_logged, 11)
+        self.assertEqual(metrics.total_submission_bytes_logged, 111)
+
+    def test_baseline_profile_env_exposes_current_local_defaults(self) -> None:
+        env = baseline_profile_env(BASELINE_PROFILE_LOCAL_4090)
+        self.assertEqual(env["TRAIN_BATCH_TOKENS"], "131072")
+        self.assertEqual(env["SLIDING_EVAL_ENABLED"], "1")
+        self.assertEqual(env["TTT_ENABLED"], "0")
 
     def test_load_fullstack_candidates_supports_ranked_and_reranked_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -229,21 +249,29 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
                     train_script_path=str(train_script),
                     output_dir=tmp_dir,
                     docs_jsonl_path=str(docs_path),
+                    baseline_profile=BASELINE_PROFILE_LOCAL_4090,
                 ),
             )
             self.assertEqual(len(report.results), 1)
             result = report.results[0]
             self.assertEqual(result.exit_code, 0)
             self.assertAlmostEqual(result.final_roundtrip_val_bpb or 0.0, 1.3)
+            self.assertAlmostEqual(result.sliding_no_ttt_val_bpb or 0.0, 1.2)
+            self.assertEqual(result.primary_metric_name, "quantized_sliding_no_ttt_exact")
+            self.assertAlmostEqual(result.primary_metric_val_bpb or 0.0, 1.2)
             self.assertEqual(result.quantized_model_bytes, 11)
             self.assertEqual(result.raw_model_bytes, 19)
             self.assertIsNotNone(result.submission_bytes_including_tokenizer)
-            self.assertGreater(result.submission_bytes_including_tokenizer or 0, result.code_bytes + 11)
+            self.assertEqual(result.submission_bytes_excluding_tokenizer, 111)
+            self.assertGreater(result.submission_bytes_including_tokenizer or 0, 111)
             dataset_snapshot = Path(result.work_dir) / "dataset_snapshot.json"
             snapshot = json.loads(dataset_snapshot.read_text(encoding="utf-8"))
             self.assertEqual(snapshot["vocab_size"], 24)
             self.assertEqual(snapshot["val_files"], ["fineweb_val_000000.bin"])
             self.assertEqual(snapshot["train_files"], ["fineweb_train_000000.bin"])
+            self.assertEqual(snapshot["train_batch_tokens"], "131072")
+            self.assertEqual(snapshot["sliding_eval_enabled"], "1")
+            self.assertEqual(snapshot["ttt_enabled"], "0")
 
 
 if __name__ == "__main__":
