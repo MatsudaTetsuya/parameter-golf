@@ -152,6 +152,24 @@ class TokenizerLocalSearchTest(unittest.TestCase):
             prune_counts[pair.prune_rank] = prune_counts.get(pair.prune_rank, 0) + 1
         self.assertLessEqual(max(prune_counts.values()), 2)
 
+    def test_select_diversified_swap_pairs_vetoes_class_mismatch(self) -> None:
+        merge_candidates = [
+            MergeCandidate("20", "2", "0", 10, 11, 100, 1.0),
+            MergeCandidate("▁News", "▁Ne", "ws", 20, 21, 90, 0.9),
+        ]
+        prunable_pieces = [
+            PrunablePiece(100, "▁Ira", 0, -1.0),
+        ]
+        selected = select_diversified_swap_pairs(
+            merge_candidates,
+            prunable_pieces,
+            neighbors_per_candidate=2,
+            max_pairs_per_prune=2,
+            class_mismatch_penalty=0.05,
+        )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].merge_candidate.merged_piece, "▁News")
+
     def test_piece_taxonomy_marks_risky_wordstem_regrowth(self) -> None:
         self.assertEqual(classify_piece("▁COVID"), "wordstem")
         self.assertEqual(classify_piece("’s"), "contraction")

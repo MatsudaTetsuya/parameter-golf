@@ -120,6 +120,9 @@ class PieceSwapOperation:
     prune_leverage_penalty: float = 0.0
     new_piece_support_penalty: float = 0.0
     safe_prune_penalty: float = 0.0
+    affected_local_delta_bpb: float = 0.0
+    affected_doc_count: int = 0
+    prune_affected_doc_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,7 @@ class LocalSearchCandidate:
     model_sha256: str
     evaluation: TokenizerCandidateEvaluation
     swaps: tuple[PieceSwapOperation, ...] = ()
+    search_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -377,7 +381,78 @@ def docs_containing_token_id(
     return selected
 
 
-def prune_leverage_delta_bpb(
+def doc_refs_containing_token_id(
+    *,
+    tokenized_docs: Sequence[Sequence[int]],
+    split_name: str,
+    token_id: int,
+    max_docs: int,
+) -> list[tuple[str, int]]:
+    if max_docs <= 0:
+        return []
+    selected: list[tuple[str, int]] = []
+    for index, token_ids in enumerate(tokenized_docs):
+        if token_id in token_ids:
+            selected.append((split_name, index))
+            if len(selected) >= max_docs:
+                break
+    return selected
+
+
+def doc_refs_containing_pair_ids(
+    *,
+    tokenized_docs: Sequence[Sequence[int]],
+    split_name: str,
+    left_token_id: int,
+    right_token_id: int,
+    max_docs: int,
+) -> list[tuple[str, int]]:
+    if max_docs <= 0:
+        return []
+    selected: list[tuple[str, int]] = []
+    for index, token_ids in enumerate(tokenized_docs):
+        if any(left == left_token_id and right == right_token_id for left, right in zip(token_ids, token_ids[1:])):
+            selected.append((split_name, index))
+            if len(selected) >= max_docs:
+                break
+    return selected
+
+
+def dedupe_doc_refs(
+    refs: Sequence[tuple[str, int]],
+    *,
+    max_docs: int,
+) -> list[tuple[str, int]]:
+    selected: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for ref in refs:
+        if ref in seen:
+            continue
+        selected.append(ref)
+        seen.add(ref)
+        if len(selected) >= max_docs:
+            break
+    return selected
+
+
+def docs_from_refs(
+    refs: Sequence[tuple[str, int]],
+    *,
+    train_docs: Sequence[str],
+    holdout_docs: Sequence[str],
+) -> list[str]:
+    docs: list[str] = []
+    for split_name, index in refs:
+        if split_name == "holdout":
+            docs.append(holdout_docs[index])
+        elif split_name == "train":
+            docs.append(train_docs[index])
+        else:
+            raise ValueError(f"unsupported split name {split_name!r}")
+    return docs
+
+
+def local_proxy_delta_bpb(
     *,
     parent_sp: spm.SentencePieceProcessor,
     candidate_sp: spm.SentencePieceProcessor,
@@ -499,16 +574,19 @@ def select_diversified_swap_pairs(
             return None
         if prunable_piece.piece == merge_candidate.merged_piece:
             return None
+        class_penalty = class_mismatch_penalty_for_swap(
+            pruned_piece=prunable_piece.piece,
+            regrown_piece=merge_candidate.merged_piece,
+            penalty=class_mismatch_penalty,
+        )
+        if class_penalty > 0.0:
+            return None
         return CandidateSwapPair(
             merge_candidate=merge_candidate,
             prunable_piece=prunable_piece,
             merge_rank=merge_rank,
             prune_rank=prune_rank,
-            prefilter_penalty=class_mismatch_penalty_for_swap(
-                pruned_piece=prunable_piece.piece,
-                regrown_piece=merge_candidate.merged_piece,
-                penalty=class_mismatch_penalty,
-            ),
+            prefilter_penalty=0.0,
         )
 
     for prune_round in range(len(prunable_pieces)):
@@ -570,6 +648,8 @@ def _resolve_split_manifest_path(
 
 
 def candidate_search_score(candidate: LocalSearchCandidate) -> float:
+    if candidate.search_score is not None:
+        return candidate.search_score
     return candidate.evaluation.result.score + sum(
         swap.prefilter_penalty
         + swap.prune_leverage_penalty
@@ -644,6 +724,7 @@ def run_fixed_vocab_local_search(
         model_sha256=base_sha256,
         evaluation=base_evaluation,
         swaps=(),
+        search_score=base_evaluation.result.score,
     )
     all_candidates: dict[str, LocalSearchCandidate] = {base_sha256: base_candidate}
     beam: list[LocalSearchCandidate] = [base_candidate]
@@ -699,21 +780,69 @@ def run_fixed_vocab_local_search(
                     vocab_path.unlink(missing_ok=True)
                     continue
                 candidate_sp = spm.SentencePieceProcessor(model_file=str(model_path))
-                affected_holdout_docs = docs_containing_token_id(
+                prune_holdout_refs = doc_refs_containing_token_id(
                     tokenized_docs=tokenized_holdout_docs,
-                    docs=search_holdout_docs,
+                    split_name="holdout",
                     token_id=prunable_piece.token_id,
                     max_docs=search_config.prune_leverage_max_docs,
                 )
-                remaining_affected_doc_budget = search_config.prune_leverage_max_docs - len(affected_holdout_docs)
-                affected_train_docs = docs_containing_token_id(
-                    tokenized_docs=tokenized_docs,
-                    docs=search_train_docs,
-                    token_id=prunable_piece.token_id,
-                    max_docs=max(0, remaining_affected_doc_budget),
+                pair_holdout_refs = doc_refs_containing_pair_ids(
+                    tokenized_docs=tokenized_holdout_docs,
+                    split_name="holdout",
+                    left_token_id=merge_candidate.left_token_id,
+                    right_token_id=merge_candidate.right_token_id,
+                    max_docs=search_config.prune_leverage_max_docs,
                 )
-                affected_docs = affected_holdout_docs + affected_train_docs
-                prune_delta_bpb = prune_leverage_delta_bpb(
+                prune_train_refs = doc_refs_containing_token_id(
+                    tokenized_docs=tokenized_docs,
+                    split_name="train",
+                    token_id=prunable_piece.token_id,
+                    max_docs=search_config.prune_leverage_max_docs,
+                )
+                pair_train_refs = doc_refs_containing_pair_ids(
+                    tokenized_docs=tokenized_docs,
+                    split_name="train",
+                    left_token_id=merge_candidate.left_token_id,
+                    right_token_id=merge_candidate.right_token_id,
+                    max_docs=search_config.prune_leverage_max_docs,
+                )
+                prune_refs = dedupe_doc_refs(
+                    [*prune_holdout_refs, *prune_train_refs],
+                    max_docs=search_config.prune_leverage_max_docs,
+                )
+                affected_refs = dedupe_doc_refs(
+                    [*prune_holdout_refs, *pair_holdout_refs, *prune_train_refs, *pair_train_refs],
+                    max_docs=search_config.prune_leverage_max_docs,
+                )
+                prune_affected_docs = docs_from_refs(
+                    prune_refs,
+                    train_docs=search_train_docs,
+                    holdout_docs=search_holdout_docs,
+                )
+                affected_docs = docs_from_refs(
+                    affected_refs,
+                    train_docs=search_train_docs,
+                    holdout_docs=search_holdout_docs,
+                )
+                prune_delta_bpb = local_proxy_delta_bpb(
+                    parent_sp=sp,
+                    candidate_sp=candidate_sp,
+                    train_docs=search_train_docs,
+                    affected_docs=prune_affected_docs,
+                    ngram_order=search_config.ngram_order,
+                    add_k=search_config.add_k,
+                    stream_mode=search_config.stream_mode,
+                )
+                if safe_prune_gate_penalty(
+                    pruned_piece=prunable_piece.piece,
+                    prune_delta_bpb=prune_delta_bpb,
+                    max_delta_bpb=search_config.wordstem_prune_max_delta_bpb,
+                    penalty=search_config.wordstem_prune_gate_penalty,
+                ) > 0.0:
+                    model_path.unlink(missing_ok=True)
+                    vocab_path.unlink(missing_ok=True)
+                    continue
+                affected_local_delta_bpb = local_proxy_delta_bpb(
                     parent_sp=sp,
                     candidate_sp=candidate_sp,
                     train_docs=search_train_docs,
@@ -722,7 +851,6 @@ def run_fixed_vocab_local_search(
                     add_k=search_config.add_k,
                     stream_mode=search_config.stream_mode,
                 )
-                prune_penalty = search_config.prune_leverage_weight * max(0.0, prune_delta_bpb)
                 support_penalty = new_piece_support_penalty(
                     sp=candidate_sp,
                     train_docs=search_train_docs,
@@ -730,12 +858,6 @@ def run_fixed_vocab_local_search(
                     new_piece=merge_candidate.merged_piece,
                     min_train_count=search_config.new_piece_min_train_count,
                     penalty_weight=search_config.new_piece_support_penalty_weight,
-                )
-                safe_penalty = safe_prune_gate_penalty(
-                    pruned_piece=prunable_piece.piece,
-                    prune_delta_bpb=prune_delta_bpb,
-                    max_delta_bpb=search_config.wordstem_prune_max_delta_bpb,
-                    penalty=search_config.wordstem_prune_gate_penalty,
                 )
                 evaluation = evaluate_tokenizer_candidate(
                     tokenizer_model_path=model_path,
@@ -778,10 +900,18 @@ def run_fixed_vocab_local_search(
                             prune_rank=pair.prune_rank,
                             prefilter_penalty=pair.prefilter_penalty,
                             prune_leverage_delta_bpb=prune_delta_bpb,
-                            prune_leverage_penalty=prune_penalty,
+                            prune_leverage_penalty=0.0,
                             new_piece_support_penalty=support_penalty,
-                            safe_prune_penalty=safe_penalty,
+                            safe_prune_penalty=0.0,
+                            affected_local_delta_bpb=affected_local_delta_bpb,
+                            affected_doc_count=len(affected_docs),
+                            prune_affected_doc_count=len(prune_affected_docs),
                         ),
+                    ),
+                    search_score=(
+                        candidate_search_score(beam_candidate)
+                        + search_config.prune_leverage_weight * affected_local_delta_bpb
+                        + support_penalty
                     ),
                 )
                 all_candidates[model_sha256] = candidate
