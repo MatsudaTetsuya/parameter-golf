@@ -8,10 +8,11 @@ from pathlib import Path
 import sentencepiece as spm
 
 from tokenizer_local_search import (
-    CandidateSwapPair,
     FixedVocabLocalSearchConfig,
     MergeCandidate,
     PrunablePiece,
+    candidate_search_score,
+    class_mismatch_penalty_for_swap,
     count_token_usage,
     exact_piece_exists,
     load_model_proto,
@@ -136,12 +137,36 @@ class TokenizerLocalSearchTest(unittest.TestCase):
             merge_candidates,
             prunable_pieces,
             neighbors_per_candidate=4,
+            max_pairs_per_prune=2,
+            class_mismatch_penalty=0.0,
         )
         self.assertEqual(len(selected), 4)
         selected_merge_ranks = {pair.merge_rank for pair in selected}
         self.assertIn(0, selected_merge_ranks)
         self.assertIn(1, selected_merge_ranks)
         self.assertIn(2, selected_merge_ranks)
+        prune_counts: dict[int, int] = {}
+        for pair in selected:
+            prune_counts[pair.prune_rank] = prune_counts.get(pair.prune_rank, 0) + 1
+        self.assertLessEqual(max(prune_counts.values()), 2)
+
+    def test_class_mismatch_penalty_marks_word_to_punct_or_digit_swap(self) -> None:
+        self.assertGreater(
+            class_mismatch_penalty_for_swap(
+                pruned_piece="▁Ira",
+                regrown_piece="20",
+                penalty=0.05,
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            class_mismatch_penalty_for_swap(
+                pruned_piece="▁COVID",
+                regrown_piece="▁News",
+                penalty=0.05,
+            ),
+            0.0,
+        )
 
     def test_run_fixed_vocab_local_search_generates_and_ranks_candidates(self) -> None:
         docs_path = self._write_docs_jsonl(
@@ -190,7 +215,12 @@ class TokenizerLocalSearchTest(unittest.TestCase):
         self.assertTrue((output_dir / "candidates").exists())
         self.assertEqual(report.ranked_candidates, sorted(
             report.ranked_candidates,
-            key=lambda item: (item.evaluation.result.score, item.evaluation.result.proxy_bpb_holdout, item.candidate_id),
+            key=lambda item: (
+                candidate_search_score(item),
+                item.evaluation.result.score,
+                item.evaluation.result.proxy_bpb_holdout,
+                item.candidate_id,
+            ),
         ))
         self.assertTrue(any(candidate.candidate_id != "base" for candidate in report.ranked_candidates))
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import unicodedata
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -35,6 +36,8 @@ class FixedVocabLocalSearchConfig:
     neighbors_per_candidate: int = 16
     regrow_pool_size: int = 64
     prune_pool_size: int = 64
+    max_pairs_per_prune: int = 2
+    class_mismatch_penalty: float = 0.05
     merge_score_bonus: float = 0.5
     min_improvement: float = 0.0
 
@@ -46,6 +49,7 @@ class FixedVocabLocalSearchConfig:
             "neighbors_per_candidate": self.neighbors_per_candidate,
             "regrow_pool_size": self.regrow_pool_size,
             "prune_pool_size": self.prune_pool_size,
+            "max_pairs_per_prune": self.max_pairs_per_prune,
         }
         for name, value in integer_fields.items():
             if value <= 0:
@@ -56,6 +60,8 @@ class FixedVocabLocalSearchConfig:
             raise ValueError(f"unsupported stream_mode {self.stream_mode!r}")
         if self.merge_score_bonus <= 0.0:
             raise ValueError(f"merge_score_bonus must be positive, got {self.merge_score_bonus}")
+        if self.class_mismatch_penalty < 0.0:
+            raise ValueError(f"class_mismatch_penalty must be non-negative, got {self.class_mismatch_penalty}")
         if self.min_improvement < 0.0:
             raise ValueError(f"min_improvement must be non-negative, got {self.min_improvement}")
 
@@ -91,6 +97,7 @@ class PieceSwapOperation:
     assigned_score: float
     merge_rank: int
     prune_rank: int
+    prefilter_penalty: float
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,7 @@ class CandidateSwapPair:
     prunable_piece: PrunablePiece
     merge_rank: int
     prune_rank: int
+    prefilter_penalty: float
 
 
 @dataclass(frozen=True)
@@ -244,6 +252,37 @@ def mine_prunable_pieces(
     return prunable[:pool_size]
 
 
+def _piece_content(piece: str) -> str:
+    return piece[1:] if piece.startswith(STANDALONE_SPACE_PIECE) else piece
+
+
+def is_wordlike_piece(piece: str) -> bool:
+    return any(char.isalpha() for char in _piece_content(piece))
+
+
+def is_punct_or_digit_piece(piece: str) -> bool:
+    content = _piece_content(piece)
+    if not content:
+        return False
+    for char in content:
+        if not (char.isdigit() or unicodedata.category(char).startswith("P")):
+            return False
+    return True
+
+
+def class_mismatch_penalty_for_swap(
+    *,
+    pruned_piece: str,
+    regrown_piece: str,
+    penalty: float,
+) -> float:
+    if penalty <= 0.0:
+        return 0.0
+    if is_wordlike_piece(pruned_piece) and is_punct_or_digit_piece(regrown_piece):
+        return penalty
+    return 0.0
+
+
 def swap_piece_in_proto(
     proto: sp_pb2.ModelProto,
     *,
@@ -267,23 +306,59 @@ def select_diversified_swap_pairs(
     prunable_pieces: list[PrunablePiece],
     *,
     neighbors_per_candidate: int,
+    max_pairs_per_prune: int,
+    class_mismatch_penalty: float,
 ) -> list[CandidateSwapPair]:
     selected: list[CandidateSwapPair] = []
-    for prune_rank, prunable_piece in enumerate(prunable_pieces):
-        for merge_rank, merge_candidate in enumerate(merge_candidates):
-            blocked_token_ids = {merge_candidate.left_token_id, merge_candidate.right_token_id}
-            if prunable_piece.token_id in blocked_token_ids:
+    per_prune_counts: Counter[int] = Counter()
+    used_pairs: set[tuple[int, int]] = set()
+
+    def build_pair(merge_rank: int, prune_rank: int) -> CandidateSwapPair | None:
+        if (merge_rank, prune_rank) in used_pairs:
+            return None
+        if per_prune_counts[prune_rank] >= max_pairs_per_prune:
+            return None
+        merge_candidate = merge_candidates[merge_rank]
+        prunable_piece = prunable_pieces[prune_rank]
+        if prunable_piece.token_id in {merge_candidate.left_token_id, merge_candidate.right_token_id}:
+            return None
+        if prunable_piece.piece == merge_candidate.merged_piece:
+            return None
+        return CandidateSwapPair(
+            merge_candidate=merge_candidate,
+            prunable_piece=prunable_piece,
+            merge_rank=merge_rank,
+            prune_rank=prune_rank,
+            prefilter_penalty=class_mismatch_penalty_for_swap(
+                pruned_piece=prunable_piece.piece,
+                regrown_piece=merge_candidate.merged_piece,
+                penalty=class_mismatch_penalty,
+            ),
+        )
+
+    for prune_round in range(len(prunable_pieces)):
+        for merge_rank in range(len(merge_candidates)):
+            best_pair: CandidateSwapPair | None = None
+            for prune_offset in range(len(prunable_pieces)):
+                prune_rank = (prune_round + merge_rank + prune_offset) % len(prunable_pieces)
+                pair = build_pair(merge_rank, prune_rank)
+                if pair is None:
+                    continue
+                if best_pair is None or (
+                    pair.prefilter_penalty,
+                    pair.prune_rank,
+                ) < (
+                    best_pair.prefilter_penalty,
+                    best_pair.prune_rank,
+                ):
+                    best_pair = pair
+                    if pair.prefilter_penalty == 0.0:
+                        break
+            if best_pair is None:
                 continue
-            if prunable_piece.piece == merge_candidate.merged_piece:
-                continue
-            selected.append(
-                CandidateSwapPair(
-                    merge_candidate=merge_candidate,
-                    prunable_piece=prunable_piece,
-                    merge_rank=merge_rank,
-                    prune_rank=prune_rank,
-                )
-            )
+            selected.append(best_pair)
+            used_pairs.add((best_pair.merge_rank, best_pair.prune_rank))
+            per_prune_counts[best_pair.prune_rank] += 1
             if len(selected) >= neighbors_per_candidate:
                 return selected
     return selected
@@ -319,10 +394,15 @@ def _resolve_split_manifest_path(
     return Path(split_dir).expanduser().resolve() / SEARCH_SPLIT_MANIFEST_FILENAME
 
 
+def candidate_search_score(candidate: LocalSearchCandidate) -> float:
+    return candidate.evaluation.result.score + sum(swap.prefilter_penalty for swap in candidate.swaps)
+
+
 def _rank_candidates(candidates: list[LocalSearchCandidate]) -> list[LocalSearchCandidate]:
     return sorted(
         candidates,
         key=lambda item: (
+            candidate_search_score(item),
             item.evaluation.result.score,
             item.evaluation.result.proxy_bpb_holdout,
             item.candidate_id,
@@ -385,7 +465,7 @@ def run_fixed_vocab_local_search(
     )
     all_candidates: dict[str, LocalSearchCandidate] = {base_sha256: base_candidate}
     beam: list[LocalSearchCandidate] = [base_candidate]
-    best_score = base_candidate.evaluation.result.score
+    best_score = candidate_search_score(base_candidate)
     next_candidate_index = 1
 
     for step in range(1, search_config.max_steps + 1):
@@ -412,6 +492,8 @@ def run_fixed_vocab_local_search(
                 merge_candidates,
                 prunable_pieces,
                 neighbors_per_candidate=search_config.neighbors_per_candidate,
+                max_pairs_per_prune=search_config.max_pairs_per_prune,
+                class_mismatch_penalty=search_config.class_mismatch_penalty,
             )
             for pair in selected_pairs:
                 merge_candidate = pair.merge_candidate
@@ -472,6 +554,7 @@ def run_fixed_vocab_local_search(
                             assigned_score=merge_candidate.proposed_score,
                             merge_rank=pair.merge_rank,
                             prune_rank=pair.prune_rank,
+                            prefilter_penalty=pair.prefilter_penalty,
                         ),
                     ),
                 )
@@ -481,7 +564,7 @@ def run_fixed_vocab_local_search(
         if not step_candidates:
             break
         ranked_all = _rank_candidates(list(all_candidates.values()))
-        new_best_score = ranked_all[0].evaluation.result.score
+        new_best_score = candidate_search_score(ranked_all[0])
         beam = ranked_all[: search_config.beam_width]
         if best_score - new_best_score <= search_config.min_improvement:
             best_score = new_best_score
@@ -524,6 +607,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neighbors-per-candidate", type=int, default=16, help="Neighbor budget per beam candidate")
     parser.add_argument("--regrow-pool-size", type=int, default=64, help="Number of regrow merge proposals to consider")
     parser.add_argument("--prune-pool-size", type=int, default=64, help="Number of low-frequency tail pieces to consider pruning")
+    parser.add_argument("--max-pairs-per-prune", type=int, default=2, help="Maximum selected swap pairs per pruned token")
+    parser.add_argument(
+        "--class-mismatch-penalty",
+        type=float,
+        default=0.05,
+        help="Prefilter penalty for pruning word-like pieces in favor of punctuation/digit pieces",
+    )
     parser.add_argument("--merge-score-bonus", type=float, default=0.5, help="Score bonus assigned to regrown one-step merges")
     parser.add_argument("--min-improvement", type=float, default=0.0, help="Minimum score improvement required to continue")
     return parser
@@ -556,6 +646,8 @@ def main() -> None:
             neighbors_per_candidate=args.neighbors_per_candidate,
             regrow_pool_size=args.regrow_pool_size,
             prune_pool_size=args.prune_pool_size,
+            max_pairs_per_prune=args.max_pairs_per_prune,
+            class_mismatch_penalty=args.class_mismatch_penalty,
             merge_score_bonus=args.merge_score_bonus,
             min_improvement=args.min_improvement,
         ),
