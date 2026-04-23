@@ -5,6 +5,7 @@ import hashlib
 import json
 import unicodedata
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from sentencepiece import sentencepiece_model_pb2 as sp_pb2
 
 from tokenizer_candidate_eval import TokenizerCandidateEvaluation, evaluate_tokenizer_candidate
 from tokenizer_checks import STANDALONE_SPACE_PIECE
-from tokenizer_scorer import load_docs
+from tokenizer_scorer import NgramProxyConfig, TokenizerScorerConfig, load_docs, score_tokenizer_documents
 from tokenizer_search_split import SEARCH_SPLIT_MANIFEST_FILENAME, load_search_split_manifest
 
 
@@ -21,16 +22,22 @@ from tokenizer_search_split import SEARCH_SPLIT_MANIFEST_FILENAME, load_search_s
 class FixedVocabLocalSearchConfig:
     alpha: float = 0.0
     ngram_order: int = 5
-    add_k: float = 0.1
+    add_k: float = 0.03
     stream_mode: str = "fullstack_bos"
     rare_token_freq_threshold: int = 64
-    rare_token_penalty_weight: float = 2.0
+    rare_token_penalty_weight: float = 0.0
     long_token_byte_threshold: int = 12
     long_token_penalty_weight: float = 0.05
     submission_base_bytes: int | None = None
     submission_limit_bytes: int = 16_000_000
     submission_guard_bytes: int = 15_950_000
     submission_penalty_weight: float = 0.0
+    prune_leverage_weight: float = 1.0
+    prune_leverage_max_docs: int = 256
+    new_piece_min_train_count: int = 64
+    new_piece_support_penalty_weight: float = 1.0
+    wordstem_prune_max_delta_bpb: float = 0.0
+    wordstem_prune_gate_penalty: float = 10.0
     max_steps: int = 4
     beam_width: int = 1
     neighbors_per_candidate: int = 16
@@ -50,6 +57,8 @@ class FixedVocabLocalSearchConfig:
             "regrow_pool_size": self.regrow_pool_size,
             "prune_pool_size": self.prune_pool_size,
             "max_pairs_per_prune": self.max_pairs_per_prune,
+            "prune_leverage_max_docs": self.prune_leverage_max_docs,
+            "new_piece_min_train_count": self.new_piece_min_train_count,
         }
         for name, value in integer_fields.items():
             if value <= 0:
@@ -62,6 +71,15 @@ class FixedVocabLocalSearchConfig:
             raise ValueError(f"merge_score_bonus must be positive, got {self.merge_score_bonus}")
         if self.class_mismatch_penalty < 0.0:
             raise ValueError(f"class_mismatch_penalty must be non-negative, got {self.class_mismatch_penalty}")
+        nonnegative_fields = {
+            "prune_leverage_weight": self.prune_leverage_weight,
+            "new_piece_support_penalty_weight": self.new_piece_support_penalty_weight,
+            "wordstem_prune_max_delta_bpb": self.wordstem_prune_max_delta_bpb,
+            "wordstem_prune_gate_penalty": self.wordstem_prune_gate_penalty,
+        }
+        for name, value in nonnegative_fields.items():
+            if value < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
         if self.min_improvement < 0.0:
             raise ValueError(f"min_improvement must be non-negative, got {self.min_improvement}")
 
@@ -98,6 +116,10 @@ class PieceSwapOperation:
     merge_rank: int
     prune_rank: int
     prefilter_penalty: float
+    prune_leverage_delta_bpb: float = 0.0
+    prune_leverage_penalty: float = 0.0
+    new_piece_support_penalty: float = 0.0
+    safe_prune_penalty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -256,18 +278,62 @@ def _piece_content(piece: str) -> str:
     return piece[1:] if piece.startswith(STANDALONE_SPACE_PIECE) else piece
 
 
+def classify_piece(piece: str) -> str:
+    content = _piece_content(piece)
+    if not content:
+        return "empty"
+    has_alpha = any(char.isalpha() for char in content)
+    has_digit = any(char.isdigit() for char in content)
+    punct_flags = [unicodedata.category(char).startswith("P") for char in content]
+    all_punct = all(punct_flags)
+    all_digit = all(char.isdigit() for char in content)
+    quote_chars = {"'", "’", "`", "‘"}
+    lower = content.lower()
+    contraction_suffixes = {
+        "'s",
+        "’s",
+        "'t",
+        "’t",
+        "'re",
+        "’re",
+        "'ve",
+        "’ve",
+        "'ll",
+        "’ll",
+        "'d",
+        "’d",
+        "'m",
+        "’m",
+        "n't",
+        "n’t",
+    }
+    if all_digit:
+        return "digit_only"
+    if has_digit and all(char.isdigit() or unicodedata.category(char).startswith("P") for char in content):
+        return "numeric"
+    if all_punct:
+        return "punct_only"
+    if lower in contraction_suffixes or (content[0] in quote_chars and has_alpha):
+        return "contraction"
+    if has_alpha and any(char in quote_chars for char in content):
+        return "quote_affix"
+    if has_alpha and punct_flags[-1]:
+        return "punct_suffix"
+    if has_alpha and has_digit:
+        return "alnum"
+    if has_alpha and all(char.isalpha() for char in content):
+        return "wordstem"
+    if has_alpha:
+        return "wordlike_mixed"
+    return "other"
+
+
 def is_wordlike_piece(piece: str) -> bool:
     return any(char.isalpha() for char in _piece_content(piece))
 
 
 def is_punct_or_digit_piece(piece: str) -> bool:
-    content = _piece_content(piece)
-    if not content:
-        return False
-    for char in content:
-        if not (char.isdigit() or unicodedata.category(char).startswith("P")):
-            return False
-    return True
+    return classify_piece(piece) in {"digit_only", "numeric", "punct_only"}
 
 
 def class_mismatch_penalty_for_swap(
@@ -278,7 +344,116 @@ def class_mismatch_penalty_for_swap(
 ) -> float:
     if penalty <= 0.0:
         return 0.0
-    if is_wordlike_piece(pruned_piece) and is_punct_or_digit_piece(regrown_piece):
+    pruned_class = classify_piece(pruned_piece)
+    regrown_class = classify_piece(regrown_piece)
+    risky_regrow_classes = {
+        "contraction",
+        "punct_suffix",
+        "numeric",
+        "quote_affix",
+        "punct_only",
+        "digit_only",
+    }
+    if pruned_class == "wordstem" and regrown_class in risky_regrow_classes:
+        return penalty
+    return 0.0
+
+
+def docs_containing_token_id(
+    *,
+    tokenized_docs: Sequence[Sequence[int]],
+    docs: Sequence[str],
+    token_id: int,
+    max_docs: int,
+) -> list[str]:
+    if max_docs <= 0:
+        return []
+    selected: list[str] = []
+    for token_ids, doc in zip(tokenized_docs, docs, strict=True):
+        if token_id in token_ids:
+            selected.append(doc)
+            if len(selected) >= max_docs:
+                break
+    return selected
+
+
+def prune_leverage_delta_bpb(
+    *,
+    parent_sp: spm.SentencePieceProcessor,
+    candidate_sp: spm.SentencePieceProcessor,
+    train_docs: Sequence[str],
+    affected_docs: Sequence[str],
+    ngram_order: int,
+    add_k: float,
+    stream_mode: str,
+) -> float:
+    if not affected_docs:
+        return 0.0
+    config = TokenizerScorerConfig(
+        alpha=0.0,
+        ngram=NgramProxyConfig(order=ngram_order, add_k=add_k),
+        stream_mode=stream_mode,
+        rare_token_penalty_weight=0.0,
+        long_token_penalty_weight=0.0,
+    )
+    parent_score = score_tokenizer_documents(
+        parent_sp,
+        train_docs=train_docs,
+        holdout_docs=affected_docs,
+        tokenizer_asset_bytes=0,
+        config=config,
+    )
+    candidate_score = score_tokenizer_documents(
+        candidate_sp,
+        train_docs=train_docs,
+        holdout_docs=affected_docs,
+        tokenizer_asset_bytes=0,
+        config=config,
+    )
+    return candidate_score.proxy_bpb_holdout - parent_score.proxy_bpb_holdout
+
+
+def new_piece_support_penalty(
+    *,
+    sp: spm.SentencePieceProcessor,
+    train_docs: Sequence[str],
+    holdout_docs: Sequence[str],
+    new_piece: str,
+    min_train_count: int,
+    penalty_weight: float,
+) -> float:
+    if penalty_weight <= 0.0 or min_train_count <= 0:
+        return 0.0
+    token_id = int(sp.piece_to_id(new_piece))
+    if token_id < 0 or token_id >= int(sp.vocab_size()) or sp.id_to_piece(token_id) != new_piece:
+        return penalty_weight
+    train_count = 0
+    for token_ids in tokenize_docs_with_ids(sp, list(train_docs)):
+        train_count += token_ids.count(token_id)
+    shortfall = max(0, min_train_count - train_count)
+    if shortfall <= 0:
+        return 0.0
+    holdout_token_count = 0
+    holdout_count = 0
+    for token_ids in tokenize_docs_with_ids(sp, list(holdout_docs)):
+        holdout_token_count += len(token_ids)
+        holdout_count += token_ids.count(token_id)
+    if holdout_token_count <= 0 or holdout_count <= 0:
+        return 0.0
+    holdout_mass = holdout_count / holdout_token_count
+    return penalty_weight * holdout_mass * (shortfall / min_train_count)
+
+
+def safe_prune_gate_penalty(
+    *,
+    pruned_piece: str,
+    prune_delta_bpb: float,
+    max_delta_bpb: float,
+    penalty: float,
+) -> float:
+    if penalty <= 0.0:
+        return 0.0
+    if classify_piece(pruned_piece) == "wordstem" and prune_delta_bpb > max_delta_bpb:
         return penalty
     return 0.0
 
@@ -395,7 +570,13 @@ def _resolve_split_manifest_path(
 
 
 def candidate_search_score(candidate: LocalSearchCandidate) -> float:
-    return candidate.evaluation.result.score + sum(swap.prefilter_penalty for swap in candidate.swaps)
+    return candidate.evaluation.result.score + sum(
+        swap.prefilter_penalty
+        + swap.prune_leverage_penalty
+        + swap.new_piece_support_penalty
+        + swap.safe_prune_penalty
+        for swap in candidate.swaps
+    )
 
 
 def _rank_candidates(candidates: list[LocalSearchCandidate]) -> list[LocalSearchCandidate]:
@@ -427,6 +608,7 @@ def run_fixed_vocab_local_search(
     )
     manifest = load_search_split_manifest(manifest_path)
     search_train_docs = load_docs(manifest.search_train_path, text_field=manifest.text_field)
+    search_holdout_docs = load_docs(manifest.search_holdout_path, text_field=manifest.text_field)
     output_root = Path(output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     candidate_dir = output_root / "candidates"
@@ -473,6 +655,7 @@ def run_fixed_vocab_local_search(
         for beam_candidate in beam:
             sp = spm.SentencePieceProcessor(model_file=beam_candidate.tokenizer_model_path)
             tokenized_docs = tokenize_docs_with_ids(sp, search_train_docs)
+            tokenized_holdout_docs = tokenize_docs_with_ids(sp, search_holdout_docs)
             token_counts = count_token_usage(tokenized_docs)
             merge_candidates = mine_merge_candidates(
                 sp,
@@ -515,6 +698,45 @@ def run_fixed_vocab_local_search(
                     model_path.unlink(missing_ok=True)
                     vocab_path.unlink(missing_ok=True)
                     continue
+                candidate_sp = spm.SentencePieceProcessor(model_file=str(model_path))
+                affected_holdout_docs = docs_containing_token_id(
+                    tokenized_docs=tokenized_holdout_docs,
+                    docs=search_holdout_docs,
+                    token_id=prunable_piece.token_id,
+                    max_docs=search_config.prune_leverage_max_docs,
+                )
+                remaining_affected_doc_budget = search_config.prune_leverage_max_docs - len(affected_holdout_docs)
+                affected_train_docs = docs_containing_token_id(
+                    tokenized_docs=tokenized_docs,
+                    docs=search_train_docs,
+                    token_id=prunable_piece.token_id,
+                    max_docs=max(0, remaining_affected_doc_budget),
+                )
+                affected_docs = affected_holdout_docs + affected_train_docs
+                prune_delta_bpb = prune_leverage_delta_bpb(
+                    parent_sp=sp,
+                    candidate_sp=candidate_sp,
+                    train_docs=search_train_docs,
+                    affected_docs=affected_docs,
+                    ngram_order=search_config.ngram_order,
+                    add_k=search_config.add_k,
+                    stream_mode=search_config.stream_mode,
+                )
+                prune_penalty = search_config.prune_leverage_weight * max(0.0, prune_delta_bpb)
+                support_penalty = new_piece_support_penalty(
+                    sp=candidate_sp,
+                    train_docs=search_train_docs,
+                    holdout_docs=search_holdout_docs,
+                    new_piece=merge_candidate.merged_piece,
+                    min_train_count=search_config.new_piece_min_train_count,
+                    penalty_weight=search_config.new_piece_support_penalty_weight,
+                )
+                safe_penalty = safe_prune_gate_penalty(
+                    pruned_piece=prunable_piece.piece,
+                    prune_delta_bpb=prune_delta_bpb,
+                    max_delta_bpb=search_config.wordstem_prune_max_delta_bpb,
+                    penalty=search_config.wordstem_prune_gate_penalty,
+                )
                 evaluation = evaluate_tokenizer_candidate(
                     tokenizer_model_path=model_path,
                     split_manifest_path=manifest_path,
@@ -555,6 +777,10 @@ def run_fixed_vocab_local_search(
                             merge_rank=pair.merge_rank,
                             prune_rank=pair.prune_rank,
                             prefilter_penalty=pair.prefilter_penalty,
+                            prune_leverage_delta_bpb=prune_delta_bpb,
+                            prune_leverage_penalty=prune_penalty,
+                            new_piece_support_penalty=support_penalty,
+                            safe_prune_penalty=safe_penalty,
                         ),
                     ),
                 )
@@ -592,16 +818,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=None, help="Optional directory for persistent evaluation cache")
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
     parser.add_argument("--ngram-order", type=int, default=5, help="Backoff n-gram order")
-    parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
+    parser.add_argument("--add-k", type=float, default=0.03, help="Additive smoothing constant")
     parser.add_argument("--stream-mode", choices=("fullstack_bos", "legacy_eos"), default="fullstack_bos")
     parser.add_argument("--rare-token-freq-threshold", type=int, default=64)
-    parser.add_argument("--rare-token-penalty-weight", type=float, default=2.0)
+    parser.add_argument("--rare-token-penalty-weight", type=float, default=0.0)
     parser.add_argument("--long-token-byte-threshold", type=int, default=12)
     parser.add_argument("--long-token-penalty-weight", type=float, default=0.05)
     parser.add_argument("--submission-base-bytes", type=int, default=None)
     parser.add_argument("--submission-limit-bytes", type=int, default=16_000_000)
     parser.add_argument("--submission-guard-bytes", type=int, default=15_950_000)
     parser.add_argument("--submission-penalty-weight", type=float, default=0.0)
+    parser.add_argument("--prune-leverage-weight", type=float, default=1.0)
+    parser.add_argument("--prune-leverage-max-docs", type=int, default=256)
+    parser.add_argument("--new-piece-min-train-count", type=int, default=64)
+    parser.add_argument("--new-piece-support-penalty-weight", type=float, default=1.0)
+    parser.add_argument("--wordstem-prune-max-delta-bpb", type=float, default=0.0)
+    parser.add_argument("--wordstem-prune-gate-penalty", type=float, default=10.0)
     parser.add_argument("--max-steps", type=int, default=4, help="Maximum local-search steps")
     parser.add_argument("--beam-width", type=int, default=1, help="Beam width")
     parser.add_argument("--neighbors-per-candidate", type=int, default=16, help="Neighbor budget per beam candidate")
@@ -641,6 +873,12 @@ def main() -> None:
             submission_limit_bytes=args.submission_limit_bytes,
             submission_guard_bytes=args.submission_guard_bytes,
             submission_penalty_weight=args.submission_penalty_weight,
+            prune_leverage_weight=args.prune_leverage_weight,
+            prune_leverage_max_docs=args.prune_leverage_max_docs,
+            new_piece_min_train_count=args.new_piece_min_train_count,
+            new_piece_support_penalty_weight=args.new_piece_support_penalty_weight,
+            wordstem_prune_max_delta_bpb=args.wordstem_prune_max_delta_bpb,
+            wordstem_prune_gate_penalty=args.wordstem_prune_gate_penalty,
             max_steps=args.max_steps,
             beam_width=args.beam_width,
             neighbors_per_candidate=args.neighbors_per_candidate,

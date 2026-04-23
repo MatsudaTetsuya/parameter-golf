@@ -12,6 +12,7 @@ from tokenizer_local_search import (
     MergeCandidate,
     PrunablePiece,
     candidate_search_score,
+    classify_piece,
     class_mismatch_penalty_for_swap,
     count_token_usage,
     exact_piece_exists,
@@ -20,6 +21,7 @@ from tokenizer_local_search import (
     mine_prunable_pieces,
     run_fixed_vocab_local_search,
     select_diversified_swap_pairs,
+    safe_prune_gate_penalty,
     swap_piece_in_proto,
     tokenize_docs_with_ids,
     write_model_artifacts,
@@ -150,7 +152,13 @@ class TokenizerLocalSearchTest(unittest.TestCase):
             prune_counts[pair.prune_rank] = prune_counts.get(pair.prune_rank, 0) + 1
         self.assertLessEqual(max(prune_counts.values()), 2)
 
-    def test_class_mismatch_penalty_marks_word_to_punct_or_digit_swap(self) -> None:
+    def test_piece_taxonomy_marks_risky_wordstem_regrowth(self) -> None:
+        self.assertEqual(classify_piece("▁COVID"), "wordstem")
+        self.assertEqual(classify_piece("’s"), "contraction")
+        self.assertEqual(classify_piece("’t"), "contraction")
+        self.assertEqual(classify_piece("s,"), "punct_suffix")
+        self.assertEqual(classify_piece("▁I’"), "quote_affix")
+        self.assertEqual(classify_piece("20"), "digit_only")
         self.assertGreater(
             class_mismatch_penalty_for_swap(
                 pruned_piece="▁Ira",
@@ -159,11 +167,49 @@ class TokenizerLocalSearchTest(unittest.TestCase):
             ),
             0.0,
         )
+        for regrown_piece in ("’s", "’t", "s,", "▁I’"):
+            self.assertGreater(
+                class_mismatch_penalty_for_swap(
+                    pruned_piece="▁COVID",
+                    regrown_piece=regrown_piece,
+                    penalty=0.05,
+                ),
+                0.0,
+            )
         self.assertEqual(
             class_mismatch_penalty_for_swap(
                 pruned_piece="▁COVID",
                 regrown_piece="▁News",
                 penalty=0.05,
+            ),
+            0.0,
+        )
+
+    def test_safe_prune_gate_penalty_only_blocks_harmful_wordstems(self) -> None:
+        self.assertGreater(
+            safe_prune_gate_penalty(
+                pruned_piece="▁COVID",
+                prune_delta_bpb=0.01,
+                max_delta_bpb=0.0,
+                penalty=10.0,
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            safe_prune_gate_penalty(
+                pruned_piece="20",
+                prune_delta_bpb=0.01,
+                max_delta_bpb=0.0,
+                penalty=10.0,
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            safe_prune_gate_penalty(
+                pruned_piece="▁COVID",
+                prune_delta_bpb=-0.01,
+                max_delta_bpb=0.0,
+                penalty=10.0,
             ),
             0.0,
         )

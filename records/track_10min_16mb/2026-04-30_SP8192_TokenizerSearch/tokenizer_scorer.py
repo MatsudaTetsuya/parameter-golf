@@ -21,7 +21,7 @@ from tokenizer_checks import (
 @dataclass(frozen=True)
 class NgramProxyConfig:
     order: int = 5
-    add_k: float = 0.1
+    add_k: float = 0.03
 
     def __post_init__(self) -> None:
         if self.order <= 0:
@@ -38,7 +38,7 @@ class TokenizerScorerConfig:
     extra_asset_paths: tuple[str, ...] = ()
     stream_mode: str = "fullstack_bos"
     rare_token_freq_threshold: int = 64
-    rare_token_penalty_weight: float = 2.0
+    rare_token_penalty_weight: float = 0.0
     long_token_byte_threshold: int = 12
     long_token_penalty_weight: float = 0.05
     submission_base_bytes: int | None = None
@@ -423,7 +423,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--holdout-docs", required=True, help="Holdout docs path (.txt or .jsonl)")
     parser.add_argument("--text-field", default="text", help="JSONL text field name")
     parser.add_argument("--ngram-order", type=int, default=5, help="Backoff n-gram order")
-    parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
+    parser.add_argument("--add-k", type=float, default=0.03, help="Additive smoothing constant")
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
     parser.add_argument(
         "--stream-mode",
@@ -432,7 +432,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Token stream construction mode for proxy scoring",
     )
     parser.add_argument("--rare-token-freq-threshold", type=int, default=64, help="Train-frequency threshold for rare-token mass")
-    parser.add_argument("--rare-token-penalty-weight", type=float, default=2.0, help="Penalty weight on holdout mass assigned to rare train tokens")
+    parser.add_argument("--rare-token-penalty-weight", type=float, default=0.0, help="Penalty weight on holdout mass assigned to rare train tokens")
     parser.add_argument("--long-token-byte-threshold", type=int, default=12, help="Byte-length threshold above which tokens are penalized")
     parser.add_argument("--long-token-penalty-weight", type=float, default=0.05, help="Penalty weight on holdout mass assigned to overly long tokens")
     parser.add_argument("--submission-base-bytes", type=int, default=None, help="Optional fixed base submission bytes used for budget-aware penalty")
