@@ -146,6 +146,51 @@ class TokenizerCandidateEvalTest(unittest.TestCase):
         self.assertAlmostEqual(first.result.score, second.result.score)
         self.assertAlmostEqual(first.result.proxy_bpb_holdout, second.result.proxy_bpb_holdout)
 
+    def test_cache_key_changes_with_stream_mode(self) -> None:
+        docs_path = self._write_docs_jsonl(
+            [
+                "challenge val zero",
+                "challenge val one",
+                "hello world",
+                "hello tokenizer",
+                "small tokenizer world",
+                "world hello again",
+                "tokenizer search objective",
+            ],
+            docs_val=2,
+        )
+        split_dir = docs_path.parent / "search_split_stream_mode"
+        write_search_split(
+            docs_path,
+            output_dir=split_dir,
+            config=SearchSplitConfig(
+                search_train_docs=3,
+                search_holdout_docs=2,
+            ),
+        )
+        model_path = self._train_bpe_model(
+            "hello world\nhello tokenizer\nsmall tokenizer world\nworld hello again\ntokenizer search objective\n",
+        )
+        cache_dir = docs_path.parent / "eval_cache_stream_mode"
+        evaluate_tokenizer_candidate(
+            tokenizer_model_path=model_path,
+            split_dir=split_dir,
+            ngram_order=3,
+            add_k=0.1,
+            stream_mode="fullstack_bos",
+            cache_dir=cache_dir,
+        )
+        evaluate_tokenizer_candidate(
+            tokenizer_model_path=model_path,
+            split_dir=split_dir,
+            ngram_order=3,
+            add_k=0.1,
+            stream_mode="legacy_eos",
+            cache_dir=cache_dir,
+        )
+        cache_files = list((cache_dir / TOKENIZER_EVAL_CACHE_SUBDIR).glob("*.json"))
+        self.assertEqual(len(cache_files), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,7 +18,7 @@ from tokenizer_search_split import load_search_split_manifest
 from tokenizer_scorer import load_docs
 
 
-PROXY_TRAIN_CACHE_VERSION = 1
+PROXY_TRAIN_CACHE_VERSION = 2
 PROXY_TRAIN_CACHE_SUBDIR = "proxy_training"
 
 
@@ -235,6 +235,7 @@ def build_proxy_train_cache_key_payload(
             "weight_decay": config.weight_decay,
             "seed": config.seed,
             "device": device,
+            "stream_mode": "fullstack_bos",
         },
     }
 
@@ -319,12 +320,13 @@ def tokenize_docs_to_stream(
     sp: spm.SentencePieceProcessor,
     docs: list[str],
 ) -> torch.Tensor:
-    eos_id = int(sp.eos_id())
+    bos_id = int(sp.bos_id())
+    if bos_id < 0:
+        raise ValueError("SentencePiece model must define bos_id")
     tokens: list[int] = []
     for doc in docs:
+        tokens.append(bos_id)
         tokens.extend(sp.encode(doc, out_type=int))
-        if eos_id >= 0:
-            tokens.append(eos_id)
     return torch.tensor(tokens, dtype=torch.long)
 
 

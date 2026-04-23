@@ -8,13 +8,17 @@ from pathlib import Path
 import sentencepiece as spm
 
 from tokenizer_local_search import (
+    CandidateSwapPair,
     FixedVocabLocalSearchConfig,
+    MergeCandidate,
+    PrunablePiece,
     count_token_usage,
     exact_piece_exists,
     load_model_proto,
     mine_merge_candidates,
     mine_prunable_pieces,
     run_fixed_vocab_local_search,
+    select_diversified_swap_pairs,
     swap_piece_in_proto,
     tokenize_docs_with_ids,
     write_model_artifacts,
@@ -116,6 +120,28 @@ class TokenizerLocalSearchTest(unittest.TestCase):
             candidate_sp = spm.SentencePieceProcessor(model_file=str(model_out))
             self.assertTrue(exact_piece_exists(candidate_sp, "hell"))
             self.assertIn("hell", candidate_sp.encode("hello there world", out_type=str))
+
+    def test_select_diversified_swap_pairs_includes_multiple_merge_ranks(self) -> None:
+        merge_candidates = [
+            MergeCandidate("aa", "a", "a", 10, 11, 100, 1.0),
+            MergeCandidate("bb", "b", "b", 20, 21, 90, 0.9),
+            MergeCandidate("cc", "c", "c", 30, 31, 80, 0.8),
+        ]
+        prunable_pieces = [
+            PrunablePiece(100, "x", 0, -1.0),
+            PrunablePiece(101, "y", 1, -0.5),
+            PrunablePiece(102, "z", 2, -0.1),
+        ]
+        selected = select_diversified_swap_pairs(
+            merge_candidates,
+            prunable_pieces,
+            neighbors_per_candidate=4,
+        )
+        self.assertEqual(len(selected), 4)
+        selected_merge_ranks = {pair.merge_rank for pair in selected}
+        self.assertIn(0, selected_merge_ranks)
+        self.assertIn(1, selected_merge_ranks)
+        self.assertIn(2, selected_merge_ranks)
 
     def test_run_fixed_vocab_local_search_generates_and_ranks_candidates(self) -> None:
         docs_path = self._write_docs_jsonl(

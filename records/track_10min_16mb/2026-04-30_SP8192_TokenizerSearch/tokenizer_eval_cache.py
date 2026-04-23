@@ -6,10 +6,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from tokenizer_scorer import tokenizer_asset_paths
+from tokenizer_scorer import TokenizerScorerConfig, tokenizer_asset_paths
 
 
-TOKENIZER_EVAL_CACHE_VERSION = 1
+TOKENIZER_EVAL_CACHE_VERSION = 2
 TOKENIZER_EVAL_CACHE_SUBDIR = "evaluations"
 
 
@@ -53,9 +53,7 @@ def build_tokenizer_eval_cache_key_payload(
     tokenizer_vocab_path: str | Path | None,
     tokenizer_extra_asset_paths: tuple[str, ...],
     split_manifest_path: str | Path,
-    alpha: float,
-    ngram_order: int,
-    add_k: float,
+    scorer_config: TokenizerScorerConfig,
 ) -> dict[str, Any]:
     model_path = Path(tokenizer_model_path).expanduser().resolve()
     vocab_path = None if tokenizer_vocab_path is None else Path(tokenizer_vocab_path).expanduser().resolve()
@@ -75,9 +73,22 @@ def build_tokenizer_eval_cache_key_payload(
         "tokenizer_vocab_path": None if vocab_path is None else str(vocab_path),
         "tokenizer_extra_asset_paths": [str(Path(path).expanduser().resolve()) for path in tokenizer_extra_asset_paths],
         "asset_fingerprints": asset_fingerprints,
-        "alpha": alpha,
-        "ngram_order": ngram_order,
-        "add_k": add_k,
+        "scorer_config": {
+            "alpha": scorer_config.alpha,
+            "ngram_order": scorer_config.ngram.order,
+            "add_k": scorer_config.ngram.add_k,
+            "text_field": scorer_config.text_field,
+            "extra_asset_paths": list(scorer_config.extra_asset_paths),
+            "stream_mode": scorer_config.stream_mode,
+            "rare_token_freq_threshold": scorer_config.rare_token_freq_threshold,
+            "rare_token_penalty_weight": scorer_config.rare_token_penalty_weight,
+            "long_token_byte_threshold": scorer_config.long_token_byte_threshold,
+            "long_token_penalty_weight": scorer_config.long_token_penalty_weight,
+            "submission_base_bytes": scorer_config.submission_base_bytes,
+            "submission_limit_bytes": scorer_config.submission_limit_bytes,
+            "submission_guard_bytes": scorer_config.submission_guard_bytes,
+            "submission_penalty_weight": scorer_config.submission_penalty_weight,
+        },
     }
 
 

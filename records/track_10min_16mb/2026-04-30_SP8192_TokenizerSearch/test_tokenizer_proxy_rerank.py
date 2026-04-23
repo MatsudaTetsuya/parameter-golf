@@ -14,6 +14,7 @@ from tokenizer_proxy_rerank import (
     ProxyTrainingConfig,
     load_top_candidates_from_report,
     rerank_candidates_with_proxy_training,
+    tokenize_docs_to_stream,
 )
 from tokenizer_search_split import SearchSplitConfig, write_search_split
 
@@ -76,6 +77,18 @@ class TokenizerProxyRerankTest(unittest.TestCase):
         specs = load_top_candidates_from_report(report_path, top_k=1)
         self.assertEqual(len(specs), 1)
         self.assertEqual(specs[0].label, "a")
+
+    def test_tokenize_docs_to_stream_uses_bos_without_eos(self) -> None:
+        model_path = self._train_bpe_model(
+            "hello world\nhello tokenizer\nsmall tokenizer world\nworld hello again\n",
+        )
+        sp = spm.SentencePieceProcessor(model_file=str(model_path))
+        stream = tokenize_docs_to_stream(sp, ["hello world", "hello tokenizer"])
+        bos_id = int(sp.bos_id())
+        eos_id = int(sp.eos_id())
+        self.assertEqual(int(stream[0].item()), bos_id)
+        self.assertIn(bos_id, stream.tolist())
+        self.assertNotIn(eos_id, stream.tolist())
 
     def test_proxy_rerank_penalizes_extra_asset_for_identical_tokenizer(self) -> None:
         docs_path = self._write_docs_jsonl(

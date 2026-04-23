@@ -21,6 +21,15 @@ class FixedVocabLocalSearchConfig:
     alpha: float = 0.0
     ngram_order: int = 5
     add_k: float = 0.1
+    stream_mode: str = "fullstack_bos"
+    rare_token_freq_threshold: int = 64
+    rare_token_penalty_weight: float = 2.0
+    long_token_byte_threshold: int = 12
+    long_token_penalty_weight: float = 0.05
+    submission_base_bytes: int | None = None
+    submission_limit_bytes: int = 16_000_000
+    submission_guard_bytes: int = 15_950_000
+    submission_penalty_weight: float = 0.0
     max_steps: int = 4
     beam_width: int = 1
     neighbors_per_candidate: int = 16
@@ -43,6 +52,8 @@ class FixedVocabLocalSearchConfig:
                 raise ValueError(f"{name} must be positive, got {value}")
         if self.add_k <= 0.0:
             raise ValueError(f"add_k must be positive, got {self.add_k}")
+        if self.stream_mode not in {"fullstack_bos", "legacy_eos"}:
+            raise ValueError(f"unsupported stream_mode {self.stream_mode!r}")
         if self.merge_score_bonus <= 0.0:
             raise ValueError(f"merge_score_bonus must be positive, got {self.merge_score_bonus}")
         if self.min_improvement < 0.0:
@@ -78,6 +89,8 @@ class PieceSwapOperation:
     left_piece: str
     right_piece: str
     assigned_score: float
+    merge_rank: int
+    prune_rank: int
 
 
 @dataclass(frozen=True)
@@ -90,6 +103,14 @@ class LocalSearchCandidate:
     model_sha256: str
     evaluation: TokenizerCandidateEvaluation
     swaps: tuple[PieceSwapOperation, ...] = ()
+
+
+@dataclass(frozen=True)
+class CandidateSwapPair:
+    merge_candidate: MergeCandidate
+    prunable_piece: PrunablePiece
+    merge_rank: int
+    prune_rank: int
 
 
 @dataclass(frozen=True)
@@ -241,6 +262,33 @@ def swap_piece_in_proto(
     return updated
 
 
+def select_diversified_swap_pairs(
+    merge_candidates: list[MergeCandidate],
+    prunable_pieces: list[PrunablePiece],
+    *,
+    neighbors_per_candidate: int,
+) -> list[CandidateSwapPair]:
+    selected: list[CandidateSwapPair] = []
+    for prune_rank, prunable_piece in enumerate(prunable_pieces):
+        for merge_rank, merge_candidate in enumerate(merge_candidates):
+            blocked_token_ids = {merge_candidate.left_token_id, merge_candidate.right_token_id}
+            if prunable_piece.token_id in blocked_token_ids:
+                continue
+            if prunable_piece.piece == merge_candidate.merged_piece:
+                continue
+            selected.append(
+                CandidateSwapPair(
+                    merge_candidate=merge_candidate,
+                    prunable_piece=prunable_piece,
+                    merge_rank=merge_rank,
+                    prune_rank=prune_rank,
+                )
+            )
+            if len(selected) >= neighbors_per_candidate:
+                return selected
+    return selected
+
+
 def write_model_artifacts(
     proto: sp_pb2.ModelProto,
     *,
@@ -314,6 +362,15 @@ def run_fixed_vocab_local_search(
         alpha=search_config.alpha,
         ngram_order=search_config.ngram_order,
         add_k=search_config.add_k,
+        stream_mode=search_config.stream_mode,
+        rare_token_freq_threshold=search_config.rare_token_freq_threshold,
+        rare_token_penalty_weight=search_config.rare_token_penalty_weight,
+        long_token_byte_threshold=search_config.long_token_byte_threshold,
+        long_token_penalty_weight=search_config.long_token_penalty_weight,
+        submission_base_bytes=search_config.submission_base_bytes,
+        submission_limit_bytes=search_config.submission_limit_bytes,
+        submission_guard_bytes=search_config.submission_guard_bytes,
+        submission_penalty_weight=search_config.submission_penalty_weight,
     )
     base_sha256 = hashlib.sha256(base_model_path.read_bytes()).hexdigest()
     base_candidate = LocalSearchCandidate(
@@ -351,69 +408,76 @@ def run_fixed_vocab_local_search(
             if not merge_candidates or not prunable_pieces:
                 continue
             base_proto = load_model_proto(beam_candidate.tokenizer_model_path)
-            generated_for_parent = 0
-            for merge_candidate in merge_candidates:
-                for prunable_piece in prunable_pieces:
-                    if prunable_piece.token_id in {merge_candidate.left_token_id, merge_candidate.right_token_id}:
-                        continue
-                    if prunable_piece.piece == merge_candidate.merged_piece:
-                        continue
-                    candidate_id = f"step{step:02d}_{next_candidate_index:04d}"
-                    updated_proto = swap_piece_in_proto(
-                        base_proto,
-                        prune_token_id=prunable_piece.token_id,
-                        regrow_candidate=merge_candidate,
-                    )
-                    model_path = candidate_dir / f"{candidate_id}.model"
-                    vocab_path = candidate_dir / f"{candidate_id}.vocab"
-                    model_sha256 = write_model_artifacts(
-                        updated_proto,
-                        model_path=model_path,
-                        vocab_path=vocab_path,
-                    )
-                    if model_sha256 in all_candidates:
-                        model_path.unlink(missing_ok=True)
-                        vocab_path.unlink(missing_ok=True)
-                        continue
-                    evaluation = evaluate_tokenizer_candidate(
-                        tokenizer_model_path=model_path,
-                        split_manifest_path=manifest_path,
-                        tokenizer_vocab_path=vocab_path,
-                        cache_dir=cache_dir,
-                        alpha=search_config.alpha,
-                        ngram_order=search_config.ngram_order,
-                        add_k=search_config.add_k,
-                    )
-                    candidate = LocalSearchCandidate(
-                        candidate_id=candidate_id,
-                        parent_candidate_id=beam_candidate.candidate_id,
-                        step=step,
-                        tokenizer_model_path=str(model_path),
-                        tokenizer_vocab_path=str(vocab_path),
-                        model_sha256=model_sha256,
-                        evaluation=evaluation,
-                        swaps=beam_candidate.swaps
-                        + (
-                            PieceSwapOperation(
-                                pruned_token_id=prunable_piece.token_id,
-                                pruned_piece=prunable_piece.piece,
-                                pruned_count=prunable_piece.count,
-                                regrown_piece=merge_candidate.merged_piece,
-                                regrow_pair_count=merge_candidate.pair_count,
-                                left_piece=merge_candidate.left_piece,
-                                right_piece=merge_candidate.right_piece,
-                                assigned_score=merge_candidate.proposed_score,
-                            ),
+            selected_pairs = select_diversified_swap_pairs(
+                merge_candidates,
+                prunable_pieces,
+                neighbors_per_candidate=search_config.neighbors_per_candidate,
+            )
+            for pair in selected_pairs:
+                merge_candidate = pair.merge_candidate
+                prunable_piece = pair.prunable_piece
+                candidate_id = f"step{step:02d}_{next_candidate_index:04d}"
+                updated_proto = swap_piece_in_proto(
+                    base_proto,
+                    prune_token_id=prunable_piece.token_id,
+                    regrow_candidate=merge_candidate,
+                )
+                model_path = candidate_dir / f"{candidate_id}.model"
+                vocab_path = candidate_dir / f"{candidate_id}.vocab"
+                model_sha256 = write_model_artifacts(
+                    updated_proto,
+                    model_path=model_path,
+                    vocab_path=vocab_path,
+                )
+                if model_sha256 in all_candidates:
+                    model_path.unlink(missing_ok=True)
+                    vocab_path.unlink(missing_ok=True)
+                    continue
+                evaluation = evaluate_tokenizer_candidate(
+                    tokenizer_model_path=model_path,
+                    split_manifest_path=manifest_path,
+                    tokenizer_vocab_path=vocab_path,
+                    cache_dir=cache_dir,
+                    alpha=search_config.alpha,
+                    ngram_order=search_config.ngram_order,
+                    add_k=search_config.add_k,
+                    stream_mode=search_config.stream_mode,
+                    rare_token_freq_threshold=search_config.rare_token_freq_threshold,
+                    rare_token_penalty_weight=search_config.rare_token_penalty_weight,
+                    long_token_byte_threshold=search_config.long_token_byte_threshold,
+                    long_token_penalty_weight=search_config.long_token_penalty_weight,
+                    submission_base_bytes=search_config.submission_base_bytes,
+                    submission_limit_bytes=search_config.submission_limit_bytes,
+                    submission_guard_bytes=search_config.submission_guard_bytes,
+                    submission_penalty_weight=search_config.submission_penalty_weight,
+                )
+                candidate = LocalSearchCandidate(
+                    candidate_id=candidate_id,
+                    parent_candidate_id=beam_candidate.candidate_id,
+                    step=step,
+                    tokenizer_model_path=str(model_path),
+                    tokenizer_vocab_path=str(vocab_path),
+                    model_sha256=model_sha256,
+                    evaluation=evaluation,
+                    swaps=beam_candidate.swaps
+                    + (
+                        PieceSwapOperation(
+                            pruned_token_id=prunable_piece.token_id,
+                            pruned_piece=prunable_piece.piece,
+                            pruned_count=prunable_piece.count,
+                            regrown_piece=merge_candidate.merged_piece,
+                            regrow_pair_count=merge_candidate.pair_count,
+                            left_piece=merge_candidate.left_piece,
+                            right_piece=merge_candidate.right_piece,
+                            assigned_score=merge_candidate.proposed_score,
+                            merge_rank=pair.merge_rank,
+                            prune_rank=pair.prune_rank,
                         ),
-                    )
-                    all_candidates[model_sha256] = candidate
-                    step_candidates.append(candidate)
-                    generated_for_parent += 1
-                    next_candidate_index += 1
-                    if generated_for_parent >= search_config.neighbors_per_candidate:
-                        break
-                if generated_for_parent >= search_config.neighbors_per_candidate:
-                    break
+                    ),
+                )
+                all_candidates[model_sha256] = candidate
+                step_candidates.append(candidate)
+                next_candidate_index += 1
         if not step_candidates:
             break
         ranked_all = _rank_candidates(list(all_candidates.values()))
@@ -446,6 +510,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
     parser.add_argument("--ngram-order", type=int, default=5, help="Backoff n-gram order")
     parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
+    parser.add_argument("--stream-mode", choices=("fullstack_bos", "legacy_eos"), default="fullstack_bos")
+    parser.add_argument("--rare-token-freq-threshold", type=int, default=64)
+    parser.add_argument("--rare-token-penalty-weight", type=float, default=2.0)
+    parser.add_argument("--long-token-byte-threshold", type=int, default=12)
+    parser.add_argument("--long-token-penalty-weight", type=float, default=0.05)
+    parser.add_argument("--submission-base-bytes", type=int, default=None)
+    parser.add_argument("--submission-limit-bytes", type=int, default=16_000_000)
+    parser.add_argument("--submission-guard-bytes", type=int, default=15_950_000)
+    parser.add_argument("--submission-penalty-weight", type=float, default=0.0)
     parser.add_argument("--max-steps", type=int, default=4, help="Maximum local-search steps")
     parser.add_argument("--beam-width", type=int, default=1, help="Beam width")
     parser.add_argument("--neighbors-per-candidate", type=int, default=16, help="Neighbor budget per beam candidate")
@@ -469,6 +542,15 @@ def main() -> None:
             alpha=args.alpha,
             ngram_order=args.ngram_order,
             add_k=args.add_k,
+            stream_mode=args.stream_mode,
+            rare_token_freq_threshold=args.rare_token_freq_threshold,
+            rare_token_penalty_weight=args.rare_token_penalty_weight,
+            long_token_byte_threshold=args.long_token_byte_threshold,
+            long_token_penalty_weight=args.long_token_penalty_weight,
+            submission_base_bytes=args.submission_base_bytes,
+            submission_limit_bytes=args.submission_limit_bytes,
+            submission_guard_bytes=args.submission_guard_bytes,
+            submission_penalty_weight=args.submission_penalty_weight,
             max_steps=args.max_steps,
             beam_width=args.beam_width,
             neighbors_per_candidate=args.neighbors_per_candidate,

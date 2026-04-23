@@ -32,6 +32,7 @@ class ObjectiveSanityReport:
     alpha: float
     ngram_order: int
     add_k: float
+    stream_mode: str
     ranked_candidates: list[RankedTokenizerCandidate]
 
 
@@ -75,6 +76,15 @@ def evaluate_candidate_specs(
     alpha: float = 0.0,
     ngram_order: int = 5,
     add_k: float = 0.1,
+    stream_mode: str = "fullstack_bos",
+    rare_token_freq_threshold: int = 64,
+    rare_token_penalty_weight: float = 2.0,
+    long_token_byte_threshold: int = 12,
+    long_token_penalty_weight: float = 0.05,
+    submission_base_bytes: int | None = None,
+    submission_limit_bytes: int = 16_000_000,
+    submission_guard_bytes: int = 15_950_000,
+    submission_penalty_weight: float = 0.0,
 ) -> ObjectiveSanityReport:
     if not candidate_specs:
         raise ValueError("candidate_specs must not be empty")
@@ -90,6 +100,15 @@ def evaluate_candidate_specs(
             alpha=alpha,
             ngram_order=ngram_order,
             add_k=add_k,
+            stream_mode=stream_mode,
+            rare_token_freq_threshold=rare_token_freq_threshold,
+            rare_token_penalty_weight=rare_token_penalty_weight,
+            long_token_byte_threshold=long_token_byte_threshold,
+            long_token_penalty_weight=long_token_penalty_weight,
+            submission_base_bytes=submission_base_bytes,
+            submission_limit_bytes=submission_limit_bytes,
+            submission_guard_bytes=submission_guard_bytes,
+            submission_penalty_weight=submission_penalty_weight,
         )
         candidate_evaluations.append((spec, evaluation))
     candidate_evaluations.sort(
@@ -119,6 +138,7 @@ def evaluate_candidate_specs(
         alpha=alpha,
         ngram_order=ngram_order,
         add_k=add_k,
+        stream_mode=stream_mode,
         ranked_candidates=ranked_candidates,
     )
 
@@ -132,6 +152,15 @@ def run_objective_sanity_check(
     alpha: float = 0.0,
     ngram_order: int = 5,
     add_k: float = 0.1,
+    stream_mode: str = "fullstack_bos",
+    rare_token_freq_threshold: int = 64,
+    rare_token_penalty_weight: float = 2.0,
+    long_token_byte_threshold: int = 12,
+    long_token_penalty_weight: float = 0.05,
+    submission_base_bytes: int | None = None,
+    submission_limit_bytes: int = 16_000_000,
+    submission_guard_bytes: int = 15_950_000,
+    submission_penalty_weight: float = 0.0,
 ) -> ObjectiveSanityReport:
     return evaluate_candidate_specs(
         load_candidate_specs(candidates_path),
@@ -141,6 +170,15 @@ def run_objective_sanity_check(
         alpha=alpha,
         ngram_order=ngram_order,
         add_k=add_k,
+        stream_mode=stream_mode,
+        rare_token_freq_threshold=rare_token_freq_threshold,
+        rare_token_penalty_weight=rare_token_penalty_weight,
+        long_token_byte_threshold=long_token_byte_threshold,
+        long_token_penalty_weight=long_token_penalty_weight,
+        submission_base_bytes=submission_base_bytes,
+        submission_limit_bytes=submission_limit_bytes,
+        submission_guard_bytes=submission_guard_bytes,
+        submission_penalty_weight=submission_penalty_weight,
     )
 
 
@@ -153,6 +191,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ngram-order", type=int, default=5, help="Backoff n-gram order")
     parser.add_argument("--add-k", type=float, default=0.1, help="Additive smoothing constant")
     parser.add_argument("--alpha", type=float, default=0.0, help="Tokenizer asset byte penalty coefficient")
+    parser.add_argument("--stream-mode", choices=("fullstack_bos", "legacy_eos"), default="fullstack_bos")
+    parser.add_argument("--rare-token-freq-threshold", type=int, default=64)
+    parser.add_argument("--rare-token-penalty-weight", type=float, default=2.0)
+    parser.add_argument("--long-token-byte-threshold", type=int, default=12)
+    parser.add_argument("--long-token-penalty-weight", type=float, default=0.05)
+    parser.add_argument("--submission-base-bytes", type=int, default=None)
+    parser.add_argument("--submission-limit-bytes", type=int, default=16_000_000)
+    parser.add_argument("--submission-guard-bytes", type=int, default=15_950_000)
+    parser.add_argument("--submission-penalty-weight", type=float, default=0.0)
     return parser
 
 
@@ -166,6 +213,15 @@ def main() -> None:
         alpha=args.alpha,
         ngram_order=args.ngram_order,
         add_k=args.add_k,
+        stream_mode=args.stream_mode,
+        rare_token_freq_threshold=args.rare_token_freq_threshold,
+        rare_token_penalty_weight=args.rare_token_penalty_weight,
+        long_token_byte_threshold=args.long_token_byte_threshold,
+        long_token_penalty_weight=args.long_token_penalty_weight,
+        submission_base_bytes=args.submission_base_bytes,
+        submission_limit_bytes=args.submission_limit_bytes,
+        submission_guard_bytes=args.submission_guard_bytes,
+        submission_penalty_weight=args.submission_penalty_weight,
     )
     print(json.dumps(asdict(report), indent=2, sort_keys=True))
 
