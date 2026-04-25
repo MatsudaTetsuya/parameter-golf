@@ -20,6 +20,7 @@ from tokenizer_local_search import (
     mine_merge_candidates,
     mine_prunable_pieces,
     run_fixed_vocab_local_search,
+    sample_doc_refs,
     select_diversified_swap_pairs,
     safe_prune_gate_penalty,
     swap_piece_in_proto,
@@ -231,6 +232,21 @@ class TokenizerLocalSearchTest(unittest.TestCase):
             ),
             0.0,
         )
+
+    def test_sample_doc_refs_can_sample_across_full_match_range(self) -> None:
+        refs = [("train", index) for index in range(12)]
+        self.assertEqual(
+            sample_doc_refs(refs, max_docs=4, sampling_mode="first", seed=0),
+            [("train", 0), ("train", 1), ("train", 2), ("train", 3)],
+        )
+        self.assertEqual(
+            sample_doc_refs(refs, max_docs=4, sampling_mode="stratified", seed=0),
+            [("train", 1), ("train", 4), ("train", 7), ("train", 10)],
+        )
+        random_sample = sample_doc_refs(refs, max_docs=4, sampling_mode="stratified_random", seed=123)
+        self.assertEqual(random_sample, sample_doc_refs(refs, max_docs=4, sampling_mode="stratified_random", seed=123))
+        self.assertEqual(len(random_sample), 4)
+        self.assertGreater(random_sample[-1][1], 8)
 
     def test_run_fixed_vocab_local_search_generates_and_ranks_candidates(self) -> None:
         docs_path = self._write_docs_jsonl(

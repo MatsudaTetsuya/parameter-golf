@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 import unicodedata
 from collections import Counter
 from collections.abc import Sequence
@@ -34,6 +35,8 @@ class FixedVocabLocalSearchConfig:
     submission_penalty_weight: float = 0.0
     prune_leverage_weight: float = 1.0
     prune_leverage_max_docs: int = 256
+    affected_doc_sampling_mode: str = "stratified_random"
+    affected_doc_sampling_seed: int = 0
     new_piece_min_train_count: int = 64
     new_piece_support_penalty_weight: float = 1.0
     wordstem_prune_max_delta_bpb: float = 0.0
@@ -67,6 +70,8 @@ class FixedVocabLocalSearchConfig:
             raise ValueError(f"add_k must be positive, got {self.add_k}")
         if self.stream_mode not in {"fullstack_bos", "legacy_eos"}:
             raise ValueError(f"unsupported stream_mode {self.stream_mode!r}")
+        if self.affected_doc_sampling_mode not in {"first", "stratified", "random", "stratified_random"}:
+            raise ValueError(f"unsupported affected_doc_sampling_mode {self.affected_doc_sampling_mode!r}")
         if self.merge_score_bonus <= 0.0:
             raise ValueError(f"merge_score_bonus must be positive, got {self.merge_score_bonus}")
         if self.class_mismatch_penalty < 0.0:
@@ -363,6 +368,44 @@ def class_mismatch_penalty_for_swap(
     return 0.0
 
 
+def stable_sampling_seed(base_seed: int, *parts: object) -> int:
+    payload = "|".join(str(part) for part in (base_seed, *parts)).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
+
+
+def sample_doc_refs(
+    refs: Sequence[tuple[str, int]],
+    *,
+    max_docs: int,
+    sampling_mode: str,
+    seed: int,
+) -> list[tuple[str, int]]:
+    if max_docs <= 0:
+        return []
+    if len(refs) <= max_docs:
+        return list(refs)
+    if sampling_mode == "first":
+        return list(refs[:max_docs])
+    if sampling_mode == "random":
+        rng = random.Random(seed)
+        indices = sorted(rng.sample(range(len(refs)), max_docs))
+        return [refs[index] for index in indices]
+    if sampling_mode in {"stratified", "stratified_random"}:
+        rng = None if sampling_mode == "stratified" else random.Random(seed)
+        sampled: list[tuple[str, int]] = []
+        for slot in range(max_docs):
+            start = (len(refs) * slot) // max_docs
+            end = max(start + 1, (len(refs) * (slot + 1)) // max_docs)
+            if rng is None:
+                index = (start + end - 1) // 2
+            else:
+                index = rng.randrange(start, end)
+            sampled.append(refs[index])
+        return sampled
+    raise ValueError(f"unsupported sampling_mode {sampling_mode!r}")
+
+
 def docs_containing_token_id(
     *,
     tokenized_docs: Sequence[Sequence[int]],
@@ -387,6 +430,8 @@ def doc_refs_containing_token_id(
     split_name: str,
     token_id: int,
     max_docs: int,
+    sampling_mode: str = "first",
+    seed: int = 0,
 ) -> list[tuple[str, int]]:
     if max_docs <= 0:
         return []
@@ -394,9 +439,7 @@ def doc_refs_containing_token_id(
     for index, token_ids in enumerate(tokenized_docs):
         if token_id in token_ids:
             selected.append((split_name, index))
-            if len(selected) >= max_docs:
-                break
-    return selected
+    return sample_doc_refs(selected, max_docs=max_docs, sampling_mode=sampling_mode, seed=seed)
 
 
 def doc_refs_containing_pair_ids(
@@ -406,6 +449,8 @@ def doc_refs_containing_pair_ids(
     left_token_id: int,
     right_token_id: int,
     max_docs: int,
+    sampling_mode: str = "first",
+    seed: int = 0,
 ) -> list[tuple[str, int]]:
     if max_docs <= 0:
         return []
@@ -413,15 +458,15 @@ def doc_refs_containing_pair_ids(
     for index, token_ids in enumerate(tokenized_docs):
         if any(left == left_token_id and right == right_token_id for left, right in zip(token_ids, token_ids[1:])):
             selected.append((split_name, index))
-            if len(selected) >= max_docs:
-                break
-    return selected
+    return sample_doc_refs(selected, max_docs=max_docs, sampling_mode=sampling_mode, seed=seed)
 
 
 def dedupe_doc_refs(
     refs: Sequence[tuple[str, int]],
     *,
     max_docs: int,
+    sampling_mode: str = "first",
+    seed: int = 0,
 ) -> list[tuple[str, int]]:
     selected: list[tuple[str, int]] = []
     seen: set[tuple[str, int]] = set()
@@ -430,9 +475,7 @@ def dedupe_doc_refs(
             continue
         selected.append(ref)
         seen.add(ref)
-        if len(selected) >= max_docs:
-            break
-    return selected
+    return sample_doc_refs(selected, max_docs=max_docs, sampling_mode=sampling_mode, seed=seed)
 
 
 def docs_from_refs(
@@ -785,6 +828,14 @@ def run_fixed_vocab_local_search(
                     split_name="holdout",
                     token_id=prunable_piece.token_id,
                     max_docs=search_config.prune_leverage_max_docs,
+                    sampling_mode=search_config.affected_doc_sampling_mode,
+                    seed=stable_sampling_seed(
+                        search_config.affected_doc_sampling_seed,
+                        step,
+                        beam_candidate.candidate_id,
+                        "prune_holdout",
+                        prunable_piece.token_id,
+                    ),
                 )
                 pair_holdout_refs = doc_refs_containing_pair_ids(
                     tokenized_docs=tokenized_holdout_docs,
@@ -792,12 +843,29 @@ def run_fixed_vocab_local_search(
                     left_token_id=merge_candidate.left_token_id,
                     right_token_id=merge_candidate.right_token_id,
                     max_docs=search_config.prune_leverage_max_docs,
+                    sampling_mode=search_config.affected_doc_sampling_mode,
+                    seed=stable_sampling_seed(
+                        search_config.affected_doc_sampling_seed,
+                        step,
+                        beam_candidate.candidate_id,
+                        "pair_holdout",
+                        merge_candidate.left_token_id,
+                        merge_candidate.right_token_id,
+                    ),
                 )
                 prune_train_refs = doc_refs_containing_token_id(
                     tokenized_docs=tokenized_docs,
                     split_name="train",
                     token_id=prunable_piece.token_id,
                     max_docs=search_config.prune_leverage_max_docs,
+                    sampling_mode=search_config.affected_doc_sampling_mode,
+                    seed=stable_sampling_seed(
+                        search_config.affected_doc_sampling_seed,
+                        step,
+                        beam_candidate.candidate_id,
+                        "prune_train",
+                        prunable_piece.token_id,
+                    ),
                 )
                 pair_train_refs = doc_refs_containing_pair_ids(
                     tokenized_docs=tokenized_docs,
@@ -805,14 +873,41 @@ def run_fixed_vocab_local_search(
                     left_token_id=merge_candidate.left_token_id,
                     right_token_id=merge_candidate.right_token_id,
                     max_docs=search_config.prune_leverage_max_docs,
+                    sampling_mode=search_config.affected_doc_sampling_mode,
+                    seed=stable_sampling_seed(
+                        search_config.affected_doc_sampling_seed,
+                        step,
+                        beam_candidate.candidate_id,
+                        "pair_train",
+                        merge_candidate.left_token_id,
+                        merge_candidate.right_token_id,
+                    ),
                 )
                 prune_refs = dedupe_doc_refs(
                     [*prune_holdout_refs, *prune_train_refs],
                     max_docs=search_config.prune_leverage_max_docs,
+                    sampling_mode=search_config.affected_doc_sampling_mode,
+                    seed=stable_sampling_seed(
+                        search_config.affected_doc_sampling_seed,
+                        step,
+                        beam_candidate.candidate_id,
+                        "prune_union",
+                        prunable_piece.token_id,
+                    ),
                 )
                 affected_refs = dedupe_doc_refs(
                     [*prune_holdout_refs, *pair_holdout_refs, *prune_train_refs, *pair_train_refs],
                     max_docs=search_config.prune_leverage_max_docs,
+                    sampling_mode=search_config.affected_doc_sampling_mode,
+                    seed=stable_sampling_seed(
+                        search_config.affected_doc_sampling_seed,
+                        step,
+                        beam_candidate.candidate_id,
+                        "affected_union",
+                        prunable_piece.token_id,
+                        merge_candidate.left_token_id,
+                        merge_candidate.right_token_id,
+                    ),
                 )
                 prune_affected_docs = docs_from_refs(
                     prune_refs,
@@ -960,6 +1055,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--submission-penalty-weight", type=float, default=0.0)
     parser.add_argument("--prune-leverage-weight", type=float, default=1.0)
     parser.add_argument("--prune-leverage-max-docs", type=int, default=256)
+    parser.add_argument(
+        "--affected-doc-sampling-mode",
+        choices=("first", "stratified", "random", "stratified_random"),
+        default="stratified_random",
+        help="How to sample docs used for affected-region local delta",
+    )
+    parser.add_argument("--affected-doc-sampling-seed", type=int, default=0)
     parser.add_argument("--new-piece-min-train-count", type=int, default=64)
     parser.add_argument("--new-piece-support-penalty-weight", type=float, default=1.0)
     parser.add_argument("--wordstem-prune-max-delta-bpb", type=float, default=0.0)
@@ -1005,6 +1107,8 @@ def main() -> None:
             submission_penalty_weight=args.submission_penalty_weight,
             prune_leverage_weight=args.prune_leverage_weight,
             prune_leverage_max_docs=args.prune_leverage_max_docs,
+            affected_doc_sampling_mode=args.affected_doc_sampling_mode,
+            affected_doc_sampling_seed=args.affected_doc_sampling_seed,
             new_piece_min_train_count=args.new_piece_min_train_count,
             new_piece_support_penalty_weight=args.new_piece_support_penalty_weight,
             wordstem_prune_max_delta_bpb=args.wordstem_prune_max_delta_bpb,
