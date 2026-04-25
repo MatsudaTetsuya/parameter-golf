@@ -10,6 +10,7 @@ import sentencepiece as spm
 
 from tokenizer_fullstack_eval import (
     BASELINE_PROFILE_LOCAL_4090,
+    BASELINE_PROFILE_LOCAL_4090_MINIFULL,
     FullStackCandidateSpec,
     FullStackEvalConfig,
     baseline_profile_env,
@@ -17,6 +18,7 @@ from tokenizer_fullstack_eval import (
     parse_train_log_metrics,
     prepare_candidate_dataset,
     run_fullstack_evaluation,
+    select_primary_metric,
 )
 
 
@@ -85,6 +87,7 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
                     "vocab_size": vocab_size,
                     "train_batch_tokens": os.environ.get("TRAIN_BATCH_TOKENS"),
                     "sliding_eval_enabled": os.environ.get("SLIDING_EVAL_ENABLED"),
+                    "sliding_sample_chunks": os.environ.get("SLIDING_SAMPLE_CHUNKS"),
                     "ttt_enabled": os.environ.get("TTT_ENABLED"),
                     "train_files": sorted(p.name for p in data_path.glob("fineweb_train_*.bin")),
                     "val_files": sorted(p.name for p in data_path.glob("fineweb_val_*.bin")),
@@ -100,6 +103,7 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
                     f"Total submission size quantized+brotli: 111 bytes",
                     f"final_quantized_roundtrip val_loss:1.5000 val_bpb:1.3000 eval_time:1ms",
                     f"final_quantized_roundtrip_exact val_loss:1.50000000 val_bpb:1.30000000",
+                    f"quantized_sampled_sliding_no_ttt_summary_exact seeds:1,2,3 mean_val_loss:1.45000000 mean_val_bpb:1.25000000 worst_val_bpb:1.27000000",
                     f"quantized_sliding_no_ttt val_loss:1.4000 val_bpb:1.2000 eval_time:1ms",
                     f"quantized_sliding_no_ttt_exact val_loss:1.40000000 val_bpb:1.20000000",
                 ]
@@ -122,6 +126,7 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
                     "Serialized model quantized+brotli: 11 bytes",
                     "Total submission size quantized+brotli: 111 bytes",
                     "final_quantized_roundtrip_exact val_loss:1.80000000 val_bpb:1.11111111",
+                    "quantized_sampled_sliding_no_ttt_summary_exact seeds:1,2,3 mean_val_loss:1.75000000 mean_val_bpb:1.05000000 worst_val_bpb:1.07000000",
                     "quantized_sliding_no_ttt_exact val_loss:1.70000000 val_bpb:1.00000000",
                     "legal_ttt_exact val_loss:1.65000000 val_bpb:0.99000000",
                 ]
@@ -131,6 +136,8 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
         self.assertAlmostEqual(metrics.last_logged_val_bpb or 0.0, 1.22)
         self.assertAlmostEqual(metrics.final_roundtrip_val_bpb or 0.0, 1.11111111)
         self.assertAlmostEqual(metrics.sliding_no_ttt_val_bpb or 0.0, 1.0)
+        self.assertAlmostEqual(metrics.sampled_sliding_no_ttt_mean_val_bpb or 0.0, 1.05)
+        self.assertAlmostEqual(metrics.sampled_sliding_no_ttt_worst_val_bpb or 0.0, 1.07)
         self.assertAlmostEqual(metrics.legal_ttt_val_bpb or 0.0, 0.99)
         self.assertEqual(metrics.raw_model_bytes_logged, 19)
         self.assertEqual(metrics.quantized_model_bytes_logged, 11)
@@ -141,6 +148,28 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
         self.assertEqual(env["TRAIN_BATCH_TOKENS"], "131072")
         self.assertEqual(env["SLIDING_EVAL_ENABLED"], "1")
         self.assertEqual(env["TTT_ENABLED"], "0")
+
+    def test_minifull_baseline_profile_uses_sampled_sliding(self) -> None:
+        env = baseline_profile_env(BASELINE_PROFILE_LOCAL_4090_MINIFULL)
+        self.assertEqual(env["TRAIN_BATCH_TOKENS"], "131072")
+        self.assertEqual(env["SLIDING_EVAL_ENABLED"], "0")
+        self.assertEqual(env["SLIDING_SAMPLE_CHUNKS"], "64")
+        self.assertEqual(env["SLIDING_SAMPLE_SEEDS"], "1,2,3")
+        self.assertEqual(env["SLIDING_SAMPLE_MODE"], "stratified_random")
+
+    def test_sampled_sliding_is_primary_when_full_sliding_is_absent(self) -> None:
+        metrics = parse_train_log_metrics(
+            "\n".join(
+                [
+                    "final_quantized_roundtrip_exact val_loss:1.80000000 val_bpb:1.11111111",
+                    "quantized_sampled_sliding_no_ttt_summary_exact seeds:1,2,3 mean_val_loss:1.75000000 mean_val_bpb:1.05000000 worst_val_bpb:1.07000000",
+                ]
+            )
+        )
+        name, loss, bpb = select_primary_metric(metrics)
+        self.assertEqual(name, "quantized_sampled_sliding_no_ttt_worst_exact")
+        self.assertAlmostEqual(loss or 0.0, 1.75)
+        self.assertAlmostEqual(bpb or 0.0, 1.07)
 
     def test_load_fullstack_candidates_supports_ranked_and_reranked_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -256,6 +285,8 @@ class TokenizerFullStackEvalTest(unittest.TestCase):
             result = report.results[0]
             self.assertEqual(result.exit_code, 0)
             self.assertAlmostEqual(result.final_roundtrip_val_bpb or 0.0, 1.3)
+            self.assertAlmostEqual(result.sampled_sliding_no_ttt_mean_val_bpb or 0.0, 1.25)
+            self.assertAlmostEqual(result.sampled_sliding_no_ttt_worst_val_bpb or 0.0, 1.27)
             self.assertAlmostEqual(result.sliding_no_ttt_val_bpb or 0.0, 1.2)
             self.assertEqual(result.primary_metric_name, "quantized_sliding_no_ttt_exact")
             self.assertAlmostEqual(result.primary_metric_val_bpb or 0.0, 1.2)

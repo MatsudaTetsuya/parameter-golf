@@ -36,6 +36,13 @@ FINAL_ROUNDTRIP_RE = re.compile(
 SLIDING_NO_TTT_RE = re.compile(
     r"quantized_sliding_no_ttt(?:_exact)?\s+val_loss:(?P<val_loss>[0-9eE+.\-]+)\s+val_bpb:(?P<val_bpb>[0-9eE+.\-]+)"
 )
+SAMPLED_SLIDING_NO_TTT_SUMMARY_RE = re.compile(
+    r"quantized_sampled_sliding_no_ttt_summary_exact\s+"
+    r"seeds:(?P<seeds>[0-9,\-]+)\s+"
+    r"mean_val_loss:(?P<mean_val_loss>[0-9eE+.\-]+)\s+"
+    r"mean_val_bpb:(?P<mean_val_bpb>[0-9eE+.\-]+)\s+"
+    r"worst_val_bpb:(?P<worst_val_bpb>[0-9eE+.\-]+)"
+)
 LEGAL_TTT_RE = re.compile(
     r"legal_ttt(?:_exact)?\s+val_loss:(?P<val_loss>[0-9eE+.\-]+)\s+val_bpb:(?P<val_bpb>[0-9eE+.\-]+)"
 )
@@ -48,6 +55,7 @@ TOTAL_SUBMISSION_BYTES_RE = re.compile(
 )
 
 BASELINE_PROFILE_LOCAL_4090 = "sp8192_local_4090"
+BASELINE_PROFILE_LOCAL_4090_MINIFULL = "sp8192_local_4090_minifull"
 BASELINE_PROFILE_ENVS = {
     BASELINE_PROFILE_LOCAL_4090: {
         "SEED": "42",
@@ -57,6 +65,18 @@ BASELINE_PROFILE_ENVS = {
         "GPTQ_RESERVE_SECONDS": "600",
         "TTT_ENABLED": "0",
         "SLIDING_EVAL_ENABLED": "1",
+    },
+    BASELINE_PROFILE_LOCAL_4090_MINIFULL: {
+        "SEED": "42",
+        "TRAIN_BATCH_TOKENS": "131072",
+        "VAL_BATCH_SIZE": "131072",
+        "MAX_WALLCLOCK_SECONDS": "10800",
+        "GPTQ_RESERVE_SECONDS": "600",
+        "TTT_ENABLED": "0",
+        "SLIDING_EVAL_ENABLED": "0",
+        "SLIDING_SAMPLE_CHUNKS": "64",
+        "SLIDING_SAMPLE_SEEDS": "1,2,3",
+        "SLIDING_SAMPLE_MODE": "stratified_random",
     }
 }
 
@@ -135,6 +155,9 @@ class ParsedTrainLogMetrics:
     final_roundtrip_val_bpb: float | None
     sliding_no_ttt_val_loss: float | None
     sliding_no_ttt_val_bpb: float | None
+    sampled_sliding_no_ttt_mean_val_loss: float | None
+    sampled_sliding_no_ttt_mean_val_bpb: float | None
+    sampled_sliding_no_ttt_worst_val_bpb: float | None
     legal_ttt_val_loss: float | None
     legal_ttt_val_bpb: float | None
     raw_model_bytes_logged: int | None
@@ -171,6 +194,9 @@ class FullStackCandidateResult:
     final_roundtrip_val_bpb: float | None
     sliding_no_ttt_val_loss: float | None
     sliding_no_ttt_val_bpb: float | None
+    sampled_sliding_no_ttt_mean_val_loss: float | None
+    sampled_sliding_no_ttt_mean_val_bpb: float | None
+    sampled_sliding_no_ttt_worst_val_bpb: float | None
     legal_ttt_val_loss: float | None
     legal_ttt_val_bpb: float | None
     primary_metric_name: str
@@ -592,6 +618,12 @@ def select_primary_metric(
 ) -> tuple[str, float | None, float | None]:
     if parsed.sliding_no_ttt_val_bpb is not None:
         return ("quantized_sliding_no_ttt_exact", parsed.sliding_no_ttt_val_loss, parsed.sliding_no_ttt_val_bpb)
+    if parsed.sampled_sliding_no_ttt_worst_val_bpb is not None:
+        return (
+            "quantized_sampled_sliding_no_ttt_worst_exact",
+            parsed.sampled_sliding_no_ttt_mean_val_loss,
+            parsed.sampled_sliding_no_ttt_worst_val_bpb,
+        )
     if parsed.final_roundtrip_val_bpb is not None:
         return ("final_quantized_roundtrip_exact", parsed.final_roundtrip_val_loss, parsed.final_roundtrip_val_bpb)
     return ("last_logged_val_bpb", parsed.last_logged_val_loss, parsed.last_logged_val_bpb)
@@ -622,6 +654,16 @@ def parse_train_log_metrics(text: str) -> ParsedTrainLogMetrics:
         sliding_val_loss = float(sliding_match.group("val_loss"))
         sliding_val_bpb = float(sliding_match.group("val_bpb"))
 
+    sampled_matches = list(SAMPLED_SLIDING_NO_TTT_SUMMARY_RE.finditer(text))
+    sampled_mean_val_loss = None
+    sampled_mean_val_bpb = None
+    sampled_worst_val_bpb = None
+    if sampled_matches:
+        sampled_match = sampled_matches[-1]
+        sampled_mean_val_loss = float(sampled_match.group("mean_val_loss"))
+        sampled_mean_val_bpb = float(sampled_match.group("mean_val_bpb"))
+        sampled_worst_val_bpb = float(sampled_match.group("worst_val_bpb"))
+
     ttt_matches = list(LEGAL_TTT_RE.finditer(text))
     legal_ttt_val_loss = None
     legal_ttt_val_bpb = None
@@ -641,6 +683,9 @@ def parse_train_log_metrics(text: str) -> ParsedTrainLogMetrics:
         final_roundtrip_val_bpb=final_val_bpb,
         sliding_no_ttt_val_loss=sliding_val_loss,
         sliding_no_ttt_val_bpb=sliding_val_bpb,
+        sampled_sliding_no_ttt_mean_val_loss=sampled_mean_val_loss,
+        sampled_sliding_no_ttt_mean_val_bpb=sampled_mean_val_bpb,
+        sampled_sliding_no_ttt_worst_val_bpb=sampled_worst_val_bpb,
         legal_ttt_val_loss=legal_ttt_val_loss,
         legal_ttt_val_bpb=legal_ttt_val_bpb,
         raw_model_bytes_logged=None if not raw_matches else int(raw_matches[-1].group("bytes")),
@@ -766,6 +811,9 @@ def run_fullstack_evaluation(
                 final_roundtrip_val_bpb=parsed.final_roundtrip_val_bpb,
                 sliding_no_ttt_val_loss=parsed.sliding_no_ttt_val_loss,
                 sliding_no_ttt_val_bpb=parsed.sliding_no_ttt_val_bpb,
+                sampled_sliding_no_ttt_mean_val_loss=parsed.sampled_sliding_no_ttt_mean_val_loss,
+                sampled_sliding_no_ttt_mean_val_bpb=parsed.sampled_sliding_no_ttt_mean_val_bpb,
+                sampled_sliding_no_ttt_worst_val_bpb=parsed.sampled_sliding_no_ttt_worst_val_bpb,
                 legal_ttt_val_loss=parsed.legal_ttt_val_loss,
                 legal_ttt_val_bpb=parsed.legal_ttt_val_bpb,
                 primary_metric_name=primary_metric_name,

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from tokenizer_fullstack_eval import (
+    BASELINE_PROFILE_ENVS,
     BASELINE_PROFILE_LOCAL_4090,
     FullStackCandidateResult,
     FullStackEvalConfig,
@@ -96,6 +97,7 @@ def run_current_baseline_evaluation(
     script_args: tuple[str, ...] = (),
     env_overrides: dict[str, str] | None = None,
     submission_limit_bytes: int = DEFAULT_SUBMISSION_LIMIT_BYTES,
+    baseline_profile: str = BASELINE_PROFILE_LOCAL_4090,
 ) -> CurrentBaselineEvalReport:
     candidates_file = Path(candidates_path).expanduser().resolve()
     if train_script_path is None:
@@ -123,13 +125,13 @@ def run_current_baseline_evaluation(
             python_executable=python_executable,
             script_args=script_args,
             env_overrides=env_overrides,
-            baseline_profile=BASELINE_PROFILE_LOCAL_4090,
+            baseline_profile=baseline_profile,
         ),
     )
     return CurrentBaselineEvalReport(
         candidates_path=str(candidates_file),
         train_script_path=str(train_script),
-        baseline_profile=BASELINE_PROFILE_LOCAL_4090,
+        baseline_profile=baseline_profile,
         submission_limit_bytes=submission_limit_bytes,
         ranked_results=rank_current_baseline_results(
             fullstack_report.results,
@@ -157,6 +159,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--script-arg", action="append", default=[], help="Extra positional argument for the train script")
     parser.add_argument("--env", action="append", default=[], help="Environment override in KEY=VALUE form")
     parser.add_argument(
+        "--baseline-profile",
+        choices=sorted(BASELINE_PROFILE_ENVS),
+        default=BASELINE_PROFILE_LOCAL_4090,
+        help="Full-stack training/evaluation profile to use",
+    )
+    parser.add_argument(
         "--submission-limit-bytes",
         type=int,
         default=DEFAULT_SUBMISSION_LIMIT_BYTES,
@@ -183,6 +191,7 @@ def main() -> None:
         script_args=tuple(args.script_arg),
         env_overrides=parse_key_value_pairs(args.env),
         submission_limit_bytes=args.submission_limit_bytes,
+        baseline_profile=args.baseline_profile,
     )
     print(json.dumps(asdict(report), indent=2, sort_keys=True))
 

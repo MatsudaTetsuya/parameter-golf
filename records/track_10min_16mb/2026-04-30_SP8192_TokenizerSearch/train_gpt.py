@@ -138,6 +138,13 @@ class Hyperparameters:
     sliding_eval_enabled = bool(int(os.environ.get("SLIDING_EVAL_ENABLED", "1" if ttt_enabled else "0")))
     sliding_chunk_tokens = int(os.environ.get("SLIDING_CHUNK_TOKENS", "32768"))
     sliding_batch_seqs = int(os.environ.get("SLIDING_BATCH_SEQS", "32"))
+    sliding_sample_chunks = int(os.environ.get("SLIDING_SAMPLE_CHUNKS", "0"))
+    sliding_sample_seeds = tuple(
+        int(x)
+        for x in os.environ.get("SLIDING_SAMPLE_SEEDS", os.environ.get("SLIDING_SAMPLE_SEED", "0")).split(",")
+        if x.strip()
+    )
+    sliding_sample_mode = os.environ.get("SLIDING_SAMPLE_MODE", "stratified_random")
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32_768))
@@ -397,6 +404,64 @@ def build_chunk_windows(
     return chunk_windows, len(window_starts)
 
 
+def _sample_stratified_range(
+    start: int,
+    end: int,
+    count: int,
+    rng: np.random.Generator | None,
+) -> list[int]:
+    span = end - start
+    if count <= 0 or span <= 0:
+        return []
+    if count >= span:
+        return list(range(start, end))
+    sampled: list[int] = []
+    for i in range(count):
+        lo = start + (span * i) // count
+        hi = start + (span * (i + 1)) // count
+        hi = max(hi, lo + 1)
+        sampled.append((lo + hi - 1) // 2 if rng is None else int(rng.integers(lo, hi)))
+    return sampled
+
+
+def select_sliding_sample_chunks(
+    num_chunks: int,
+    sample_chunks: int,
+    seed: int,
+    mode: str,
+) -> tuple[int, ...]:
+    if num_chunks <= 0:
+        raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+    if sample_chunks <= 0 or sample_chunks >= num_chunks:
+        return tuple(range(num_chunks))
+
+    normalized_mode = mode.lower().replace("-", "_")
+    rng = np.random.Generator(np.random.PCG64(seed))
+    if normalized_mode == "random":
+        return tuple(sorted(int(x) for x in rng.choice(num_chunks, size=sample_chunks, replace=False)))
+    if normalized_mode in {"stratified", "stratified_center"}:
+        return tuple(_sample_stratified_range(0, num_chunks, sample_chunks, None))
+    if normalized_mode in {"stratified_random", "uniform_stratified"}:
+        return tuple(_sample_stratified_range(0, num_chunks, sample_chunks, rng))
+    if normalized_mode in {"early_middle_late", "early_mid_late"}:
+        thirds = [
+            (0, num_chunks // 3),
+            (num_chunks // 3, (2 * num_chunks) // 3),
+            ((2 * num_chunks) // 3, num_chunks),
+        ]
+        counts = [sample_chunks // 3] * 3
+        for i in range(sample_chunks % 3):
+            counts[i] += 1
+        sampled: list[int] = []
+        for (start, end), count in zip(thirds, counts, strict=True):
+            sampled.extend(_sample_stratified_range(start, end, count, rng))
+        return tuple(sorted(set(sampled)))
+    raise ValueError(
+        "SLIDING_SAMPLE_MODE must be one of random, stratified, "
+        f"stratified_random, early_middle_late; got {mode!r}"
+    )
+
+
 def fill_batch_from_windows(
     batch_windows: list[tuple[int, int, int]],
     val_tokens: Tensor,
@@ -646,6 +711,8 @@ def eval_val_sliding(
     val_tokens: Tensor,
     luts: TokenizerLUTs,
     stride: int,
+    sample_chunk_indices: tuple[int, ...] | None = None,
+    label: str = "sliding_eval",
     log0=print,
 ) -> tuple[float, float]:
     seq_len = args.train_seq_len
@@ -663,11 +730,27 @@ def eval_val_sliding(
         total_tokens, seq_len, stride, args.sliding_chunk_tokens
     )
     num_chunks = len(chunk_windows)
+    if sample_chunk_indices is None:
+        selected_chunk_indices = tuple(range(num_chunks))
+    else:
+        selected_chunk_indices = tuple(
+            sorted({idx for idx in sample_chunk_indices if 0 <= idx < num_chunks and chunk_windows[idx]})
+        )
+        if not selected_chunk_indices:
+            raise ValueError("sample_chunk_indices selected no non-empty validation chunks")
 
-    log0(
-        f"sliding_eval:start chunks={num_chunks} chunk_tokens={args.sliding_chunk_tokens} "
-        f"total_windows={total_windows} stride={stride} batch_seqs={args.sliding_batch_seqs}"
-    )
+    if sample_chunk_indices is None:
+        log0(
+            f"{label}:start chunks={num_chunks} chunk_tokens={args.sliding_chunk_tokens} "
+            f"total_windows={total_windows} stride={stride} batch_seqs={args.sliding_batch_seqs}"
+        )
+    else:
+        sampled_windows = sum(len(chunk_windows[idx]) for idx in selected_chunk_indices)
+        log0(
+            f"{label}:start sampled_chunks={len(selected_chunk_indices)}/{num_chunks} "
+            f"chunk_tokens={args.sliding_chunk_tokens} sampled_windows={sampled_windows} "
+            f"total_windows={total_windows} stride={stride} batch_seqs={args.sliding_batch_seqs}"
+        )
     reset_rotary_caches(base_model)
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -677,7 +760,8 @@ def eval_val_sliding(
 
     base_model.eval()
     with torch.no_grad():
-        for chunk_idx, windows in enumerate(chunk_windows):
+        for selected_pos, chunk_idx in enumerate(selected_chunk_indices):
+            windows = chunk_windows[chunk_idx]
             if not windows:
                 continue
             my_window_start = (len(windows) * rank) // world_size
@@ -704,7 +788,12 @@ def eval_val_sliding(
                         x_batch[i, local_start:local_end],
                         luts,
                     ).sum()
-            if rank == 0 and (chunk_idx % 10 == 0 or chunk_idx == num_chunks - 1):
+            should_log = (
+                selected_pos % 10 == 0 or selected_pos == len(selected_chunk_indices) - 1
+                if sample_chunk_indices is not None
+                else chunk_idx % 10 == 0 or chunk_idx == num_chunks - 1
+            )
+            if rank == 0 and should_log:
                 elapsed = time.perf_counter() - t0
                 running_loss = loss_sum.item() / max(token_count.item(), 1.0)
                 running_bpb = (
@@ -712,7 +801,16 @@ def eval_val_sliding(
                     if token_count.item() > 0
                     else 0.0
                 )
-                log0(f"  sliding_chunk [{chunk_idx + 1}/{num_chunks}] bpb={running_bpb:.6f} time={elapsed:.1f}s")
+                if sample_chunk_indices is None:
+                    log0(
+                        f"  sliding_chunk [{chunk_idx + 1}/{num_chunks}] "
+                        f"bpb={running_bpb:.6f} time={elapsed:.1f}s"
+                    )
+                else:
+                    log0(
+                        f"  sampled_sliding_chunk [{selected_pos + 1}/{len(selected_chunk_indices)}] "
+                        f"chunk={chunk_idx + 1}/{num_chunks} bpb={running_bpb:.6f} time={elapsed:.1f}s"
+                    )
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -723,7 +821,7 @@ def eval_val_sliding(
     val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
     base_model.train()
     log0(
-        f"sliding_eval:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s"
+        f"{label}:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s"
     )
     return val_loss, val_bpb
 
@@ -1866,6 +1964,8 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
     validate_batching_args(args, world_size, grad_accum_steps)
+    if args.sliding_sample_chunks > 0 and not args.sliding_sample_seeds:
+        raise ValueError("SLIDING_SAMPLE_SEEDS must contain at least one seed when SLIDING_SAMPLE_CHUNKS > 0")
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -2064,6 +2164,11 @@ def main() -> None:
     log0(
         f"gptq_calibration_tokens:{args.gptq_calibration_tokens} "
         f"gptq_calibration_batches:{args.gptq_calibration_batches}"
+    )
+    log0(
+        f"sliding_sample chunks:{args.sliding_sample_chunks} "
+        f"seeds:{','.join(str(seed) for seed in args.sliding_sample_seeds)} "
+        f"mode:{args.sliding_sample_mode}"
     )
     log0(f"train_loader_mode:{'shuffled' if args.train_shuffled else 'sequential'}")
     log0(f"warmdown_frac:{args.warmdown_frac:.3f} warmdown_iters:{args.warmdown_iters}")
@@ -2413,6 +2518,54 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_quantized_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.sliding_sample_chunks > 0:
+        sampled_results: list[tuple[int, float, float]] = []
+        total_tokens = val_tokens.numel() - 1
+        sample_chunk_count = (total_tokens + args.sliding_chunk_tokens - 1) // args.sliding_chunk_tokens
+        for sample_seed in args.sliding_sample_seeds:
+            sample_indices = select_sliding_sample_chunks(
+                sample_chunk_count,
+                args.sliding_sample_chunks,
+                sample_seed,
+                args.sliding_sample_mode,
+            )
+            log0(
+                f"quantized_sampled_sliding_no_ttt_config seed:{sample_seed} "
+                f"mode:{args.sliding_sample_mode} sampled_chunks:{len(sample_indices)}/{sample_chunk_count}"
+            )
+            torch.cuda.synchronize()
+            t_sampled_sliding = time.perf_counter()
+            sampled_val_loss, sampled_val_bpb = eval_val_sliding(
+                args,
+                base_model,
+                rank,
+                world_size,
+                device,
+                val_tokens,
+                luts,
+                stride=args.eval_stride,
+                sample_chunk_indices=sample_indices,
+                label="sampled_sliding_eval",
+                log0=log0,
+            )
+            torch.cuda.synchronize()
+            sampled_results.append((sample_seed, sampled_val_loss, sampled_val_bpb))
+            log0(
+                f"quantized_sampled_sliding_no_ttt_exact seed:{sample_seed} "
+                f"val_loss:{sampled_val_loss:.8f} val_bpb:{sampled_val_bpb:.8f} "
+                f"eval_time:{1000.0 * (time.perf_counter() - t_sampled_sliding):.0f}ms"
+            )
+        if sampled_results:
+            mean_sampled_loss = sum(loss for _seed, loss, _bpb in sampled_results) / len(sampled_results)
+            mean_sampled_bpb = sum(bpb for _seed, _loss, bpb in sampled_results) / len(sampled_results)
+            worst_sampled_bpb = max(bpb for _seed, _loss, bpb in sampled_results)
+            log0(
+                "quantized_sampled_sliding_no_ttt_summary_exact "
+                f"seeds:{','.join(str(seed) for seed, _loss, _bpb in sampled_results)} "
+                f"mean_val_loss:{mean_sampled_loss:.8f} "
+                f"mean_val_bpb:{mean_sampled_bpb:.8f} "
+                f"worst_val_bpb:{worst_sampled_bpb:.8f}"
+            )
     if args.sliding_eval_enabled:
         torch.cuda.synchronize()
         t_sliding = time.perf_counter()
