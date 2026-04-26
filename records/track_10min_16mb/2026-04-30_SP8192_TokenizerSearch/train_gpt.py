@@ -105,6 +105,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     adam_wd = float(os.environ.get("ADAM_WD", 0.02))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
+    muon_wd_mlp = float(os.environ.get("MUON_WD_MLP", 0.115))
     embed_wd = float(os.environ.get("EMBED_WD", 0.085))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
 
@@ -2075,11 +2076,13 @@ def main() -> None:
     # - matrix params in transformer blocks use Muon with decoupled weight decay
     # - vectors/scalars use AdamW
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
+    matrix_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    mlp_matrix_params = [p for name, p in matrix_named_params if ".mlp." in name]
+    non_mlp_matrix_params = [p for name, p in matrix_named_params if ".mlp." not in name]
     scalar_params = [
         p
         for name, p in block_named_params
@@ -2097,8 +2100,12 @@ def main() -> None:
         weight_decay=args.embed_wd,
         fused=True,
     )
+    matrix_param_groups = [
+        {"params": non_mlp_matrix_params, "weight_decay": args.muon_wd},
+        {"params": mlp_matrix_params, "weight_decay": args.muon_wd_mlp},
+    ]
     optimizer_muon = Muon(
-        matrix_params,
+        matrix_param_groups,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
@@ -2149,7 +2156,12 @@ def main() -> None:
     )
     log0(
         f"weight_decay embed:{args.embed_wd} matrix:{args.muon_wd} "
+        f"matrix_mlp:{args.muon_wd_mlp} "
         f"scalar:{args.adam_wd} ema_decay:{args.ema_decay}"
+    )
+    log0(
+        f"muon_matrix_params non_mlp:{sum(p.numel() for p in non_mlp_matrix_params)} "
+        f"mlp:{sum(p.numel() for p in mlp_matrix_params)}"
     )
     log0(f"muon_row_normalize:{args.muon_row_normalize}")
     log0(
