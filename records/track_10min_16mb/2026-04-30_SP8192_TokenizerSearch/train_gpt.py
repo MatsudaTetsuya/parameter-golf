@@ -131,6 +131,16 @@ class Hyperparameters:
     sliding_sample_chunks = env_int("SLIDING_SAMPLE_CHUNKS", "0")
     sliding_sample_seeds = env_int_tuple("SLIDING_SAMPLE_SEEDS", env("SLIDING_SAMPLE_SEED", "0"))
     sliding_sample_mode = env("SLIDING_SAMPLE_MODE", "stratified_random")
+    ngram_cache_enabled = env_bool("NGRAM_CACHE_ENABLED", "0")
+    ngram_cache_full_eval = env_bool("NGRAM_CACHE_FULL_EVAL", "0")
+    ngram_cache_full_prefix = env_bool("NGRAM_CACHE_FULL_PREFIX", "0")
+    ngram_cache_min_order = env_int("NGRAM_CACHE_MIN_ORDER", 2)
+    ngram_cache_max_order = env_int("NGRAM_CACHE_MAX_ORDER", 3)
+    ngram_cache_alpha_base = env_float("NGRAM_CACHE_ALPHA_BASE", 0.005)
+    ngram_cache_alpha_scale = env_float("NGRAM_CACHE_ALPHA_SCALE", 0.05)
+    ngram_cache_alpha_slope = env_float("NGRAM_CACHE_ALPHA_SLOPE", 2.0)
+    ngram_cache_alpha_center = env_float("NGRAM_CACHE_ALPHA_CENTER", 4.0)
+    ngram_cache_entropy_alpha = env_bool("NGRAM_CACHE_ENTROPY_ALPHA", "0")
     ttt_lr = env_float("TTT_LR", 0.005)
     ttt_epochs = env_int("TTT_EPOCHS", 3)
     ttt_chunk_tokens = env_int("TTT_CHUNK_TOKENS", 32_768)
@@ -358,6 +368,155 @@ def loss_bpb_from_sums(loss_sum: Tensor, token_count: Tensor, byte_count: Tensor
     return float(val_loss), float(val_loss / math.log(2.0) * tokens / bytes_)
 
 
+def logaddexp_scalar(a: float, b: float) -> float:
+    m = a if a > b else b
+    return m + math.log(math.exp(a - m) + math.exp(b - m))
+
+
+def ngram_alpha(
+    entropy: float | None,
+    *,
+    alpha_base: float,
+    alpha_scale: float,
+    alpha_slope: float,
+    alpha_center: float,
+    use_entropy_alpha: bool,
+) -> float:
+    if use_entropy_alpha and entropy is not None:
+        alpha = alpha_base + alpha_scale / (1.0 + math.exp(-alpha_slope * (entropy - alpha_center)))
+    else:
+        alpha = alpha_base
+    return min(max(alpha, 0.0), 1.0)
+
+
+def fast_ngram_sweep(
+    tokens,
+    model_logp,
+    entropy,
+    token_bytes,
+    score_mask,
+    *,
+    vocab_size: int,
+    min_order: int,
+    max_order: int,
+    alpha_base: float,
+    alpha_scale: float,
+    alpha_slope: float,
+    alpha_center: float,
+    use_entropy_alpha: bool,
+    full_prefix: bool,
+) -> tuple[float, int, int, dict[str, int]]:
+    bits = (vocab_size - 1).bit_length()
+    max_ctx = max_order - 1
+    min_ctx = min_order - 1
+    totals: list[dict[int, int]] = [dict() for _ in range(max_ctx + 1)]
+    pairs: list[dict[int, int]] = [dict() for _ in range(max_ctx + 1)]
+    ctx_codes = [0] * (max_ctx + 1)
+
+    loss_sum = 0.0
+    token_count = 0
+    byte_count = 0
+    context_hits = 0
+    target_hits = 0
+    scored_updates = 0
+    skipped_updates = 0
+
+    for pos in range(1, len(tokens)):
+        target = int(tokens[pos])
+        upto = min(max_ctx, pos)
+        code = 0
+        z = 0.0
+        p_acc = 0.0
+        hit_target = False
+
+        for nctx in range(1, upto + 1):
+            code |= int(tokens[pos - nctx]) << ((nctx - 1) * bits)
+            ctx_codes[nctx] = code
+            if nctx < min_ctx:
+                continue
+            total = totals[nctx].get(code, 0)
+            if total > 0:
+                cnt = pairs[nctx].get((code << bits) | target, 0)
+                weight = math.log1p(total)
+                z += weight
+                p_acc += weight * (cnt / total)
+                hit_target = hit_target or cnt > 0
+
+        do_score = bool(score_mask[pos])
+        if do_score:
+            lp_model = float(model_logp[pos])
+            if z > 0.0:
+                context_hits += 1
+                target_hits += int(hit_target)
+                p_ngram = p_acc / z
+                alpha = ngram_alpha(
+                    None if entropy is None else float(entropy[pos]),
+                    alpha_base=alpha_base,
+                    alpha_scale=alpha_scale,
+                    alpha_slope=alpha_slope,
+                    alpha_center=alpha_center,
+                    use_entropy_alpha=use_entropy_alpha,
+                )
+                if alpha <= 0.0:
+                    lp_final = lp_model
+                elif alpha >= 1.0:
+                    lp_final = math.log(max(p_ngram, 1e-300))
+                else:
+                    lp_final = math.log1p(-alpha) + lp_model
+                    if p_ngram > 0.0:
+                        lp_final = logaddexp_scalar(lp_final, math.log(alpha) + math.log(p_ngram))
+                loss_sum += -lp_final
+            else:
+                loss_sum += -lp_model
+            token_count += 1
+            byte_count += int(token_bytes[pos])
+
+        if do_score or full_prefix:
+            for nctx in range(min_ctx, upto + 1):
+                ctx = ctx_codes[nctx]
+                totals_n = totals[nctx]
+                pairs_n = pairs[nctx]
+                totals_n[ctx] = totals_n.get(ctx, 0) + 1
+                pair_key = (ctx << bits) | target
+                pairs_n[pair_key] = pairs_n.get(pair_key, 0) + 1
+            if do_score:
+                scored_updates += 1
+            else:
+                skipped_updates += 1
+
+    stats = {
+        "contexts": sum(len(d) for d in totals),
+        "targets": sum(len(d) for d in pairs),
+        "context_hits": context_hits,
+        "target_hits": target_hits,
+        "scored_updates": scored_updates,
+        "skipped_updates": skipped_updates,
+    }
+    return loss_sum, token_count, byte_count, stats
+
+
+def validate_ngram_score_mask(
+    score_mask: Tensor,
+    total_tokens: int,
+    sample_chunk_indices: tuple[int, ...] | None,
+) -> int:
+    if int(score_mask[0].item()) != 0:
+        raise ValueError("Position 0 should never be scored as a prediction target")
+    max_scores = int(score_mask.max().item())
+    total_scored = int(score_mask.sum().item())
+    if max_scores > 1:
+        raise ValueError("Some validation positions were scored more than once")
+    if sample_chunk_indices is None and total_scored != total_tokens:
+        missing = total_tokens - total_scored
+        raise ValueError(
+            "N-gram full eval did not score every target: "
+            f"scored={total_scored}, expected={total_tokens}, missing={missing}"
+        )
+    if total_scored <= 0:
+        raise ValueError("N-gram cache eval scored no validation positions")
+    return total_scored
+
+
 def build_chunk_windows(
     total_tokens: int, seq_len: int, stride: int, chunk_tokens: int
 ) -> tuple[list[list[tuple[int, int, int]]], int]:
@@ -492,6 +651,63 @@ def add_window_scores(
                     luts,
                 ).sum()
     return loss_sum, token_count, byte_count
+
+
+def add_window_neural_outputs(
+    base_model: nn.Module,
+    windows: list[tuple[int, int, int]],
+    val_tokens: Tensor,
+    seq_len: int,
+    total_tokens: int,
+    batch_seqs: int,
+    device: torch.device,
+    luts: TokenizerLUTs,
+    model_logp_buf: Tensor,
+    entropy_buf: Tensor | None,
+    byte_buf: Tensor,
+    score_mask: Tensor,
+) -> int:
+    local_written = 0
+    with torch.no_grad():
+        for batch_start in range(0, len(windows), batch_seqs):
+            batch_windows = windows[batch_start : batch_start + batch_seqs]
+            batch_size = len(batch_windows)
+            x_batch, y_batch = fill_batch_from_windows(
+                batch_windows, val_tokens, seq_len, total_tokens, device
+            )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = base_model.forward_logits(x_batch).reshape(batch_size, seq_len, -1)
+            if entropy_buf is None:
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(batch_size, seq_len)
+                target_logp = -nll
+                entropy = None
+            else:
+                logp = F.log_softmax(logits.float(), dim=-1)
+                target_logp = logp.gather(-1, y_batch.unsqueeze(-1)).squeeze(-1)
+                entropy = -(logp.exp() * logp).sum(dim=-1)
+
+            for i, (ws, local_start, local_end) in enumerate(batch_windows):
+                pos = torch.arange(
+                    ws + local_start + 1,
+                    ws + local_end + 1,
+                    device=device,
+                    dtype=torch.long,
+                )
+                model_logp_buf[pos] = target_logp[i, local_start:local_end].to(torch.float32)
+                if entropy_buf is not None and entropy is not None:
+                    entropy_buf[pos] = entropy[i, local_start:local_end].to(torch.float32)
+                byte_buf[pos] = compute_token_bytes(
+                    y_batch[i, local_start:local_end],
+                    x_batch[i, local_start:local_end],
+                    luts,
+                ).round().to(byte_buf.dtype)
+                score_mask[pos] += 1
+                local_written += local_end - local_start
+    return local_written
 
 
 def eval_val(
@@ -695,6 +911,7 @@ def eval_val_sliding(
     stride: int,
     sample_chunk_indices: tuple[int, ...] | None = None,
     label: str = "sliding_eval",
+    use_ngram_cache: bool = False,
     log0=print,
 ) -> tuple[float, float]:
     seq_len = args.train_seq_len
@@ -707,6 +924,10 @@ def eval_val_sliding(
         raise ValueError(f"SLIDING_CHUNK_TOKENS must be positive, got {args.sliding_chunk_tokens}")
     if args.sliding_batch_seqs <= 0:
         raise ValueError(f"SLIDING_BATCH_SEQS must be positive, got {args.sliding_batch_seqs}")
+    if use_ngram_cache and sample_chunk_indices is not None and args.ngram_cache_full_prefix:
+        raise ValueError(
+            "NGRAM_CACHE_FULL_PREFIX=1 with sampled eval is diagnostic-only; disable it for record-style eval"
+        )
 
     chunk_windows, total_windows = build_chunk_windows(
         total_tokens, seq_len, stride, args.sliding_chunk_tokens
@@ -738,6 +959,25 @@ def eval_val_sliding(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    model_logp_buf: Tensor | None = None
+    entropy_buf: Tensor | None = None
+    ngram_byte_buf: Tensor | None = None
+    score_mask: Tensor | None = None
+    local_collected = 0
+    if use_ngram_cache:
+        buf_len = total_tokens + 1
+        model_logp_buf = torch.zeros(buf_len, device=device, dtype=torch.float32)
+        entropy_buf = torch.zeros(buf_len, device=device, dtype=torch.float32) if args.ngram_cache_entropy_alpha else None
+        ngram_byte_buf = torch.zeros(buf_len, device=device, dtype=torch.int32)
+        score_mask = torch.zeros(buf_len, device=device, dtype=torch.int32)
+        log0(
+            f"{label}:ngram_cache orders={args.ngram_cache_min_order}-{args.ngram_cache_max_order} "
+            f"alpha_mode:{'entropy' if args.ngram_cache_entropy_alpha else 'constant'} "
+            f"alpha=({args.ngram_cache_alpha_base},{args.ngram_cache_alpha_scale},"
+            f"{args.ngram_cache_alpha_slope},{args.ngram_cache_alpha_center}) "
+            f"entropy_alpha={int(args.ngram_cache_entropy_alpha)} "
+            f"full_prefix={int(args.ngram_cache_full_prefix)}"
+        )
     t0 = time.perf_counter()
 
     base_model.eval()
@@ -749,19 +989,36 @@ def eval_val_sliding(
             my_window_start = (len(windows) * rank) // world_size
             my_window_end = (len(windows) * (rank + 1)) // world_size
             my_windows = windows[my_window_start:my_window_end]
-            loss_sum, token_count, byte_count = add_window_scores(
-                base_model,
-                my_windows,
-                val_tokens,
-                seq_len,
-                total_tokens,
-                args.sliding_batch_seqs,
-                device,
-                luts,
-                loss_sum,
-                token_count,
-                byte_count,
-            )
+            if use_ngram_cache:
+                assert model_logp_buf is not None and ngram_byte_buf is not None and score_mask is not None
+                local_collected += add_window_neural_outputs(
+                    base_model,
+                    my_windows,
+                    val_tokens,
+                    seq_len,
+                    total_tokens,
+                    args.sliding_batch_seqs,
+                    device,
+                    luts,
+                    model_logp_buf,
+                    entropy_buf,
+                    ngram_byte_buf,
+                    score_mask,
+                )
+            else:
+                loss_sum, token_count, byte_count = add_window_scores(
+                    base_model,
+                    my_windows,
+                    val_tokens,
+                    seq_len,
+                    total_tokens,
+                    args.sliding_batch_seqs,
+                    device,
+                    luts,
+                    loss_sum,
+                    token_count,
+                    byte_count,
+                )
             should_log = (
                 selected_pos % 10 == 0 or selected_pos == len(selected_chunk_indices) - 1
                 if sample_chunk_indices is not None
@@ -769,17 +1026,71 @@ def eval_val_sliding(
             )
             if rank == 0 and should_log:
                 elapsed = time.perf_counter() - t0
-                _running_loss, running_bpb = loss_bpb_from_sums(loss_sum, token_count, byte_count, safe=True)
+                if use_ngram_cache:
+                    progress = f"local_collected={local_collected}"
+                else:
+                    _running_loss, running_bpb = loss_bpb_from_sums(loss_sum, token_count, byte_count, safe=True)
+                    progress = f"bpb={running_bpb:.6f}"
                 if sample_chunk_indices is None:
                     log0(
                         f"  sliding_chunk [{chunk_idx + 1}/{num_chunks}] "
-                        f"bpb={running_bpb:.6f} time={elapsed:.1f}s"
+                        f"{progress} time={elapsed:.1f}s"
                     )
                 else:
                     log0(
                         f"  sampled_sliding_chunk [{selected_pos + 1}/{len(selected_chunk_indices)}] "
-                        f"chunk={chunk_idx + 1}/{num_chunks} bpb={running_bpb:.6f} time={elapsed:.1f}s"
+                        f"chunk={chunk_idx + 1}/{num_chunks} {progress} time={elapsed:.1f}s"
                     )
+
+    if use_ngram_cache:
+        assert model_logp_buf is not None and ngram_byte_buf is not None and score_mask is not None
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(model_logp_buf, op=dist.ReduceOp.SUM)
+            if entropy_buf is not None:
+                dist.all_reduce(entropy_buf, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ngram_byte_buf, op=dist.ReduceOp.SUM)
+            dist.all_reduce(score_mask, op=dist.ReduceOp.SUM)
+        validate_ngram_score_mask(score_mask, total_tokens, sample_chunk_indices)
+        metric_sums = torch.zeros(3, device=device, dtype=torch.float64)
+        stats: dict[str, int] | None = None
+        if rank == 0:
+            tokens_np = val_tokens.detach().cpu().numpy()
+            if tokens_np.dtype != np.int64:
+                tokens_np = tokens_np.astype(np.int64, copy=False)
+            sweep_loss, sweep_tokens, sweep_bytes, stats = fast_ngram_sweep(
+                tokens_np,
+                model_logp_buf.detach().cpu().numpy(),
+                None if entropy_buf is None else entropy_buf.detach().cpu().numpy(),
+                ngram_byte_buf.detach().cpu().numpy(),
+                score_mask.detach().cpu().numpy().astype(bool),
+                vocab_size=args.vocab_size,
+                min_order=args.ngram_cache_min_order,
+                max_order=args.ngram_cache_max_order,
+                alpha_base=args.ngram_cache_alpha_base,
+                alpha_scale=args.ngram_cache_alpha_scale,
+                alpha_slope=args.ngram_cache_alpha_slope,
+                alpha_center=args.ngram_cache_alpha_center,
+                use_entropy_alpha=args.ngram_cache_entropy_alpha,
+                full_prefix=args.ngram_cache_full_prefix,
+            )
+            metric_sums[0] = sweep_loss
+            metric_sums[1] = float(sweep_tokens)
+            metric_sums[2] = float(sweep_bytes)
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast(metric_sums, src=0)
+        val_loss, val_bpb = loss_bpb_from_sums(metric_sums[0], metric_sums[1], metric_sums[2])
+        base_model.train()
+        if rank == 0 and stats is not None:
+            log0(
+                f"{label}:ngram_cache_stats scored_updates={stats['scored_updates']} "
+                f"skipped_updates={stats['skipped_updates']} contexts={stats['contexts']} "
+                f"targets={stats['targets']} context_hits={stats['context_hits']} "
+                f"target_hits={stats['target_hits']}"
+            )
+        log0(
+            f"{label}:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} elapsed={time.perf_counter() - t0:.1f}s"
+        )
+        return val_loss, val_bpb
 
     loss_sum, token_count, byte_count = reduce_metric_sums(loss_sum, token_count, byte_count)
     val_loss, val_bpb = loss_bpb_from_sums(loss_sum, token_count, byte_count)
@@ -1858,6 +2169,12 @@ def main() -> None:
     validate_batching_args(args, world_size, grad_accum_steps)
     if args.sliding_sample_chunks > 0 and not args.sliding_sample_seeds:
         raise ValueError("SLIDING_SAMPLE_SEEDS must contain at least one seed when SLIDING_SAMPLE_CHUNKS > 0")
+    ngram_cache_eval_enabled = args.ngram_cache_enabled
+    if args.ngram_cache_enabled:
+        if args.ngram_cache_min_order < 2:
+            raise ValueError("NGRAM_CACHE_MIN_ORDER must be >= 2")
+        if args.ngram_cache_max_order < args.ngram_cache_min_order:
+            raise ValueError("NGRAM_CACHE_MAX_ORDER must be >= NGRAM_CACHE_MIN_ORDER")
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -2059,6 +2376,15 @@ def main() -> None:
         f"seeds:{','.join(str(seed) for seed in args.sliding_sample_seeds)} "
         f"mode:{args.sliding_sample_mode}"
     )
+    log0(
+        f"ngram_cache enabled:{int(args.ngram_cache_enabled)} "
+        f"eval_enabled:{int(ngram_cache_eval_enabled)} "
+        f"orders:{args.ngram_cache_min_order}-{args.ngram_cache_max_order} "
+        f"alpha_mode:{'entropy' if args.ngram_cache_entropy_alpha else 'constant'} "
+        f"alpha_base:{args.ngram_cache_alpha_base} alpha_scale:{args.ngram_cache_alpha_scale} "
+        f"entropy_alpha:{int(args.ngram_cache_entropy_alpha)} "
+        f"full_prefix:{int(args.ngram_cache_full_prefix)} full_eval:{int(args.ngram_cache_full_eval)}"
+    )
     log0(f"train_loader_mode:{'shuffled' if args.train_shuffled else 'sequential'}")
     log0(f"warmdown_frac:{args.warmdown_frac:.3f} warmdown_iters:{args.warmdown_iters}")
     log0(f"seed:{args.seed}")
@@ -2069,6 +2395,7 @@ def main() -> None:
     def eval_sliding(
         sample_chunk_indices: tuple[int, ...] | None = None,
         label: str = "sliding_eval",
+        use_ngram_cache: bool = False,
     ) -> tuple[float, float]:
         return eval_val_sliding(
             args,
@@ -2081,6 +2408,7 @@ def main() -> None:
             stride=args.eval_stride,
             sample_chunk_indices=sample_chunk_indices,
             label=label,
+            use_ngram_cache=use_ngram_cache,
             log0=log0,
         )
 
@@ -2428,8 +2756,53 @@ def main() -> None:
                 f"mean_val_bpb:{mean_sampled_bpb:.8f} "
                 f"worst_val_bpb:{worst_sampled_bpb:.8f}"
             )
+        if ngram_cache_eval_enabled:
+            sampled_ngram_results: list[tuple[int, float, float]] = []
+            for sample_seed in args.sliding_sample_seeds:
+                sample_indices = select_sliding_sample_chunks(
+                    sample_chunk_count,
+                    args.sliding_sample_chunks,
+                    sample_seed,
+                    args.sliding_sample_mode,
+                )
+                log0(
+                    f"quantized_sampled_sliding_ngram_cache_config seed:{sample_seed} "
+                    f"mode:{args.sliding_sample_mode} sampled_chunks:{len(sample_indices)}/{sample_chunk_count}"
+                )
+                torch.cuda.synchronize()
+                t_sampled_ngram = time.perf_counter()
+                sampled_val_loss, sampled_val_bpb = eval_sliding(
+                    sample_indices,
+                    "sampled_sliding_ngram_cache_eval",
+                    use_ngram_cache=True,
+                )
+                torch.cuda.synchronize()
+                sampled_ngram_results.append((sample_seed, sampled_val_loss, sampled_val_bpb))
+                log0(
+                    f"quantized_sampled_sliding_ngram_cache_exact seed:{sample_seed} "
+                    f"val_loss:{sampled_val_loss:.8f} val_bpb:{sampled_val_bpb:.8f} "
+                    f"eval_time:{1000.0 * (time.perf_counter() - t_sampled_ngram):.0f}ms"
+                )
+            if sampled_ngram_results:
+                mean_ngram_loss = sum(loss for _seed, loss, _bpb in sampled_ngram_results) / len(sampled_ngram_results)
+                mean_ngram_bpb = sum(bpb for _seed, _loss, bpb in sampled_ngram_results) / len(sampled_ngram_results)
+                worst_ngram_bpb = max(bpb for _seed, _loss, bpb in sampled_ngram_results)
+                log0(
+                    "quantized_sampled_sliding_ngram_cache_summary_exact "
+                    f"seeds:{','.join(str(seed) for seed, _loss, _bpb in sampled_ngram_results)} "
+                    f"mean_val_loss:{mean_ngram_loss:.8f} "
+                    f"mean_val_bpb:{mean_ngram_bpb:.8f} "
+                    f"worst_val_bpb:{worst_ngram_bpb:.8f}"
+                )
+    elif ngram_cache_eval_enabled:
+        log0("ngram_cache:sampled_eval_skipped because SLIDING_SAMPLE_CHUNKS=0")
     if args.sliding_eval_enabled:
         timed_eval("quantized_sliding_no_ttt", eval_sliding)
+    if ngram_cache_eval_enabled and args.ngram_cache_full_eval:
+        timed_eval(
+            "quantized_sliding_ngram_cache",
+            lambda: eval_sliding(label="sliding_ngram_cache_eval", use_ngram_cache=True),
+        )
     if args.ttt_enabled:
         timed_eval("legal_ttt", eval_ttt)
 
